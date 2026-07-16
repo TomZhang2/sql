@@ -270,7 +270,8 @@ public class AstBuilder extends OpenSearchSQLParserBaseVisitor<UnresolvedPlan> {
     for (QuerySpecificationContext querySpec : ctx.querySpecification()) {
       datasets.add(visit(querySpec));
     }
-    return new Union(datasets.build());
+    boolean distinct = ctx.ALL().isEmpty();
+    return new Union(datasets.build(), distinct);
   }
 
   @Override

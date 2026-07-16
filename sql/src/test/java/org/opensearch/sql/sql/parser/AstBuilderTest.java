@@ -9,6 +9,7 @@ import static java.util.Collections.emptyList;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -765,6 +766,16 @@ class AstBuilderTest extends AstBuilderTestBase {
     assertNotNull(plan);
     assertTrue(plan instanceof Union);
     assertEquals(2, ((Union) plan).getDatasets().size());
+    assertFalse(((Union) plan).isDistinct());
+  }
+
+  @Test
+  public void union_distinct_builds_union_ast_node() {
+    UnresolvedPlan plan = buildAST("SELECT name FROM t1 UNION SELECT name FROM t2");
+    assertNotNull(plan);
+    assertTrue(plan instanceof Union);
+    assertEquals(2, ((Union) plan).getDatasets().size());
+    assertTrue(((Union) plan).isDistinct());
   }
 
   @Test
