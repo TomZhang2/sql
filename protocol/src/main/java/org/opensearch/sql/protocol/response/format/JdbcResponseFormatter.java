@@ -40,8 +40,9 @@ public class JdbcResponseFormatter extends JsonResponseFormatter<QueryResult> {
 
     // Populate other fields
     json.total(response.size()).size(response.size()).status(200);
-    if (!response.getCursor().equals(Cursor.None)) {
-      json.cursor(response.getCursor().toString());
+    Cursor cursor = response.getCursor();
+    if (cursor != null && !cursor.equals(Cursor.None)) {
+      json.cursor(cursor.toString());
     }
 
     return json.build();
