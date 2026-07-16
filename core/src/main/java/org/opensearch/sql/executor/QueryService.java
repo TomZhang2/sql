@@ -26,8 +26,11 @@ import org.apache.calcite.tools.Frameworks;
 import org.apache.calcite.tools.Programs;
 import org.opensearch.sql.analysis.AnalysisContext;
 import org.opensearch.sql.analysis.Analyzer;
+import org.opensearch.sql.ast.AbstractNodeVisitor;
+import org.opensearch.sql.ast.Node;
 import org.opensearch.sql.ast.statement.ExplainMode;
 import org.opensearch.sql.ast.tree.HighlightConfig;
+import org.opensearch.sql.ast.tree.Union;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.calcite.CalciteRelNodeVisitor;
@@ -101,7 +104,7 @@ public class QueryService {
       QueryType queryType,
       HighlightConfig highlightConfig,
       ResponseListener<ExecutionEngine.QueryResponse> listener) {
-    if (shouldUseCalcite(queryType)) {
+    if (shouldUseCalcite(queryType, plan)) {
       executeWithCalcite(plan, queryType, highlightConfig, listener);
     } else {
       executeWithLegacy(plan, queryType, listener, Optional.empty());
@@ -124,7 +127,7 @@ public class QueryService {
       HighlightConfig highlightConfig,
       ResponseListener<ExecutionEngine.ExplainResponse> listener,
       ExplainMode mode) {
-    if (shouldUseCalcite(queryType)) {
+    if (shouldUseCalcite(queryType, plan)) {
       explainWithCalcite(plan, queryType, highlightConfig, listener, mode);
     } else {
       explainWithLegacy(plan, queryType, listener, mode, Optional.empty());
@@ -359,8 +362,42 @@ public class QueryService {
 
   // TODO https://github.com/opensearch-project/sql/issues/3457
   // Calcite is not available for SQL query now. Maybe release in 3.1.0?
-  private boolean shouldUseCalcite(QueryType queryType) {
-    return isCalciteEnabled(settings) && queryType == QueryType.PPL;
+  // SQL queries with UNION ALL are routed through Calcite since Union is a Calcite-only feature.
+  private boolean shouldUseCalcite(QueryType queryType, UnresolvedPlan plan) {
+    if (!isCalciteEnabled(settings)) {
+      return false;
+    }
+    if (queryType == QueryType.PPL) {
+      return true;
+    }
+    return queryType == QueryType.SQL && containsUnion(plan);
+  }
+
+  private boolean containsUnion(UnresolvedPlan plan) {
+    if (plan == null) {
+      return false;
+    }
+    Boolean found =
+        plan.accept(
+            new AbstractNodeVisitor<Boolean, Void>() {
+              @Override
+              public Boolean visitUnion(Union node, Void context) {
+                return true;
+              }
+
+              @Override
+              public Boolean visitChildren(Node node, Void context) {
+                for (Node child : node.getChild()) {
+                  Boolean childResult = child.accept(this, context);
+                  if (childResult != null && childResult) {
+                    return true;
+                  }
+                }
+                return false;
+              }
+            },
+            null);
+    return Boolean.TRUE.equals(found);
   }
 
   private FrameworkConfig buildFrameworkConfig() {
