@@ -37,6 +37,7 @@ import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.RelationSubquery;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
 import org.opensearch.sql.ast.tree.TableFunction;
+import org.opensearch.sql.ast.tree.Union;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.ast.tree.Values;
 import org.opensearch.sql.common.antlr.SyntaxCheckException;
@@ -265,8 +266,11 @@ public class AstBuilder extends OpenSearchSQLParserBaseVisitor<UnresolvedPlan> {
 
   @Override
   public UnresolvedPlan visitUnionSelect(OpenSearchSQLParser.UnionSelectContext ctx) {
-    throw new SyntaxCheckException(
-        "UNION is not supported in the V2 SQL engine. Falling back to legacy engine.");
+    ImmutableList.Builder<UnresolvedPlan> datasets = ImmutableList.builder();
+    for (QuerySpecificationContext querySpec : ctx.querySpecification()) {
+      datasets.add(visit(querySpec));
+    }
+    return new Union(datasets.build());
   }
 
   @Override

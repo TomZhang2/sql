@@ -11,6 +11,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.opensearch.sql.ast.dsl.AstDSL.agg;
 import static org.opensearch.sql.ast.dsl.AstDSL.aggregate;
 import static org.opensearch.sql.ast.dsl.AstDSL.alias;
@@ -49,6 +50,7 @@ import org.opensearch.sql.ast.expression.UnresolvedArgument;
 import org.opensearch.sql.ast.tree.Join;
 import org.opensearch.sql.ast.tree.SubqueryAlias;
 import org.opensearch.sql.ast.tree.TableFunction;
+import org.opensearch.sql.ast.tree.Union;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.common.antlr.SyntaxCheckException;
 import org.opensearch.sql.exception.SemanticCheckException;
@@ -758,10 +760,11 @@ class AstBuilderTest extends AstBuilderTestBase {
   }
 
   @Test
-  public void union_throws_syntax_check_exception() {
-    assertThrows(
-        SyntaxCheckException.class,
-        () -> buildAST("SELECT name FROM t1 UNION ALL SELECT name FROM t2"));
+  public void union_builds_union_ast_node() {
+    UnresolvedPlan plan = buildAST("SELECT name FROM t1 UNION ALL SELECT name FROM t2");
+    assertNotNull(plan);
+    assertTrue(plan instanceof Union);
+    assertEquals(2, ((Union) plan).getDatasets().size());
   }
 
   @Test
