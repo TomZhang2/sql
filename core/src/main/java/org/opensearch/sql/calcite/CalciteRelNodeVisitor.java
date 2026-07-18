@@ -3037,7 +3037,9 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
 
   @Override
   public RelNode visitPaginate(Paginate paginate, CalcitePlanContext context) {
-    throw new CalciteUnsupportedException("Paginate operation is unsupported in Calcite");
+    paginate.getChild().get(0).accept(this, context);
+    context.relBuilder.limit(0, paginate.getPageSize());
+    return context.relBuilder.peek();
   }
 
   @Override

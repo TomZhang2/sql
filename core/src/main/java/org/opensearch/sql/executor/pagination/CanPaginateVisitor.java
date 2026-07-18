@@ -37,6 +37,7 @@ import org.opensearch.sql.ast.tree.Limit;
 import org.opensearch.sql.ast.tree.Project;
 import org.opensearch.sql.ast.tree.Relation;
 import org.opensearch.sql.ast.tree.Sort;
+import org.opensearch.sql.ast.tree.Union;
 import org.opensearch.sql.ast.tree.Values;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
 
@@ -264,5 +265,12 @@ public class CanPaginateVisitor extends AbstractNodeVisitor<Boolean, Object> {
     }
 
     return children.get(0).accept(this, context);
+  }
+
+  // Union queries are routed through Calcite, which handles pagination natively
+  // via EnumerableLimit. The V2 cursor serialization check does not apply.
+  @Override
+  public Boolean visitUnion(Union node, Object context) {
+    return Boolean.TRUE;
   }
 }
