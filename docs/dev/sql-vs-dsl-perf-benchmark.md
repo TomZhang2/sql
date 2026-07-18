@@ -6,6 +6,187 @@
 
 ---
 
+## 第零部分：SQL 插件三种引擎概述
+
+OpenSearch SQL 插件有三种执行引擎，是历史演进的结果。理解它们的差异是分析 SQL vs DSL 性能的前提。
+
+### 0.1 Legacy V1 引擎（最老）
+
+**是什么**：基于 Alibaba Druid SQL 解析器的查询翻译层。
+
+```
+SQL 字符串
+  → Druid SQL Parser 解析 → Druid AST
+  → OpenSearchActionFactory.create() → QueryAction 子类
+  → QueryAction.explain() → SearchRequestBuilder (= DSL)
+  → OpenSearch 搜索引擎执行
+```
+
+**特征**：
+- **无计划抽象**：SQL 直接翻译成 OpenSearch DSL（`SearchRequestBuilder`），没有 LogicalPlan/PhysicalPlan 层
+- **Druid 解析器**：使用 `com.alibaba.druid.sql.parser`，与 OpenSearch 生态无关
+- **支持 JOIN**：2 表 JOIN（Hash Join / Nested Loop），但限制多
+- **支持 IN 子查询**：通过 Hash Join 实现
+- **支持 COALESCE、DATE_HISTOGRAM**：Druid 解析器原生理解这些函数
+- **不支持**：3 表 JOIN、JOIN + GROUP BY、EXISTS 子查询、标量子查询、窗口函数
+- **来源**：本项目 fork 自 `elasticsearch-sql`（NLPchina/elasticsearch-sql），那个项目用 Druid 做 SQL 翻译
+
+**执行线程**：`sql-worker` 线程池（解析翻译）→ `search` 线程池（搜索引擎执行）
+
+### 0.2 V2 引擎（当前主力）
+
+**是什么**：OpenSearch 团队自研的现代化查询引擎，有完整的 AST → LogicalPlan → PhysicalPlan 抽象层。
+
+```
+SQL 字符串
+  → ANTLR 4 解析 → ParseTree (CST)
+  → AstBuilder → UnresolvedPlan (AST)
+  → Analyzer → LogicalPlan (解析符号、类型、绑定 schema)
+  → Planner → PhysicalPlan (物理执行算子树)
+  → OpenSearchExecutionEngine.execute(PhysicalPlan)
+      → PhysicalPlan 遍历 → 生成 SearchRequestBuilder (= DSL)
+      → OpenSearch 搜索引擎执行
+  → JdbcResponseFormatter → JSON 响应
+```
+
+**特征**：
+- **完整计划抽象**：AST → LogicalPlan → PhysicalPlan 三层，支持优化器
+- **ANTLR 4 文法**：自研 `OpenSearchSQLParser.g4`，与 OpenSearch 生态紧耦合
+- **Visitor 模式**：`AbstractNodeVisitor`、`LogicalPlanNodeVisitor`、`PhysicalPlanNodeVisitor`
+- **流式执行**：PhysicalPlan 实现 `Iterator<ExprValue>`，流式输出结果
+- **游标分页**：通过 `PaginatedPlanCache` 序列化 PhysicalPlan 为 cursor
+- **不支持**：JOIN（AstBuilder 抛异常回退 Legacy）、UNION（我们的扩展已改为走 Calcite）、CTE、EXISTS、标量子查询、COALESCE、DATE_HISTOGRAM
+- **支持**：窗口函数（`RANK() OVER(...)`）、派生表（`(SELECT...) AS t`）、IN 子查询（回退 Legacy V1 Hash Join）
+
+**为什么 V2 不支持 JOIN？**
+`AstBuilder.visitJoinClause()` 主动抛出 `SyntaxCheckException`，触发回退到 Legacy V1。原因：V2 的 Analyzer 和 Planner 对 JOIN 的 schema 解析和物理执行尚未实现。
+
+**为什么 V2 不支持 COALESCE/DATE_HISTOGRAM？**
+函数注册表（`BuiltinFunctionRepository`）没有注册这些函数。DATE_HISTOGRAM 还有 INTERVAL 参数解析的 NPE bug。
+
+### 0.3 Calcite 引擎（新引擎，PPL 默认 + SQL UNION）
+
+**是什么**：基于 Apache Calcite 的查询引擎，利用 Calcite 的优化器和关系代数做查询规划。
+
+```
+SQL/PPL 字符串
+  → ANTLR 4 解析 → ParseTree (CST)
+  → AstBuilder → UnresolvedPlan (AST)
+  → CalciteRelNodeVisitor.analyze(plan, context) → Calcite RelNode
+  → convertToCalcitePlan() → 加 LogicalSystemLimit
+  → OpenSearchExecutionEngine.execute(RelNode, CalcitePlanContext)
+      → OpenSearchRelRunners.run() → JDBC PreparedStatement
+      → statement.executeQuery() → ResultSet
+      → (Calcite 内部将可下推的操作生成 DSL 发给 OpenSearch)
+      → (不可下推的操作在内存中用 Calcite enumerable 算子计算)
+  → buildResultSet() → JdbcResponseFormatter → JSON 响应
+```
+
+**特征**：
+- **Calcite 优化器**：基于关系代数，支持算子下推、代价优化
+- **算子下推**：filter、aggregation、sort、limit 可下推到 OpenSearch 搜索引擎
+- **内存计算**：UNION 合并、未下推的 JOIN 等在内存中用 Enumerable 算子计算
+- **与 V2 共享 AST**：前端解析（ANTLR + AstBuilder）相同，从 `QueryService.shouldUseCalcite()` 开始分叉
+- **PPL 默认走此路径**：`plugins.calcite.enabled=true`（3.3.0 起默认），PPL 查询走 Calcite
+- **SQL 仅 UNION 走此路径**：我们的扩展让 `shouldUseCalcite` 检测到 Union 节点时路由到 Calcite（`containsUnion(plan)`）
+
+**为什么 SQL 默认不走 Calcite？**
+`QueryService.shouldUseCalcite()` 中有硬编码限制：
+```java
+// TODO https://github.com/opensearch-project/sql/issues/3457
+// Calcite is not available for SQL query now. Maybe release in 3.1.0?
+private boolean shouldUseCalcite(QueryType queryType, UnresolvedPlan plan) {
+    if (!isCalciteEnabled(settings)) return false;
+    if (queryType == QueryType.PPL) return true;
+    return queryType == QueryType.SQL && containsUnion(plan);  // ← 我们的扩展
+}
+```
+SQL 走 Calcite 的完整支持还在开发中（issue #3457），当前仅 UNION 通过我们的扩展走了过来。
+
+### 0.4 三种引擎对比
+
+| 维度 | Legacy V1 | V2 | Calcite |
+|------|-----------|-----|---------|
+| **解析器** | Druid SQL Parser | ANTLR 4 (自研文法) | ANTLR 4 (同 V2) |
+| **计划抽象** | 无（直接翻译为 DSL） | AST → LogicalPlan → PhysicalPlan | AST → RelNode (Calcite 关系代数) |
+| **优化器** | 无 | 简单规则 | Calcite 代价优化器 |
+| **算子下推** | 无 | 无（直接生成 DSL） | ✅ filter/agg/sort/limit 下推 |
+| **JOIN** | ✅ 2 表（Hash/Nested Loop） | ❌（回退 Legacy） | ✅ N 表（但 SQL 未路由到此） |
+| **UNION** | ✅（Druid 支持） | ❌（我们的扩展已改为走 Calcite） | ✅（我们的扩展） |
+| **窗口函数** | ❌ | ✅ | ✅ |
+| **游标分页** | ✅（自己的 cursor 机制） | ✅（序列化 PhysicalPlan） | ⚠️（EnumerableLimit 分页，无序列化游标） |
+| **COALESCE** | ✅ | ❌ | ✅（Calcite 原生） |
+| **DATE_HISTOGRAM** | ✅ | ❌（NPE bug） | ✅（下推 date_histogram 聚合） |
+| **回退机制** | 是 V2 的回退目标 | 是 Calcite 的回退目标 | 失败可回退到 V2 |
+| **内存计算** | 无 | 无 | 有（Enumerable 算子） |
+| **状态** | 维护中（不再新增功能） | 活跃开发 | 活跃开发（未来方向） |
+| **引入版本** | 1.0（fork 自 elasticsearch-sql） | 2.0+ | 3.0+（PPL），3.7+（SQL UNION） |
+
+### 0.5 为什么会有三种引擎？
+
+这是**历史演进**的结果：
+
+#### 阶段一：Legacy V1（1.0 ~ 2.x）
+
+OpenSearch SQL 插件 fork 自 `elasticsearch-sql`（NLPchina），那个项目用 Druid SQL 解析器把 SQL 翻译成 Elasticsearch DSL。简单直接，但：
+- 无计划抽象，无法做查询优化
+- Druid 解析器与 OpenSearch 生态脱节
+- 扩展新 SQL 语法需要改 Druid 的 Java 代码，不灵活
+- JOIN 等复杂查询性能差（Hash Join 在内存中做）
+
+#### 阶段二：V2 引擎（2.0+ ~ 现在）
+
+OpenSearch 团队自研 V2 引擎，目标：
+- 完整的 AST → LogicalPlan → PhysicalPlan 抽象层
+- 用 ANTLR 4 自定义文法，与 OpenSearch 生态紧耦合
+- 支持 Visitor 模式，方便扩展
+- 流式执行（`Iterator<ExprValue>`）
+
+但 V2 的开发**优先服务 PPL**（Piped Processing Language），SQL 的支持是次要目标。很多 SQL 特性（JOIN、UNION、CTE）在 V2 中没有实现，遇到时抛 `SyntaxCheckException` 回退到 Legacy V1。
+
+#### 阶段三：Calcite 引擎（3.0+ ~ 现在）
+
+引入 Apache Calcite 作为新的查询引擎，目标：
+- 利用 Calcite 的成熟优化器（代价优化、算子下推）
+- 统一 PPL 和 SQL 的执行路径
+- 支持更复杂的查询（N-way JOIN、子查询优化）
+- 与外部系统集成（Spark、CLI 工具）
+
+Calcite 引擎**首先在 PPL 上落地**（3.0 引入，3.3 默认启用）。SQL 走 Calcite 的工作还在进行中（issue #3457），我们的 UNION 扩展是第一步。
+
+#### 演进方向
+
+```
+Legacy V1（淘汰中）
+      ↓ 回退到
+V2 引擎（当前主力，维护中）
+      ↓ 迁移到
+Calcite 引擎（未来方向，活跃开发）
+```
+
+最终目标是 **SQL 和 PPL 都走 Calcite 引擎**，Legacy V1 退役，V2 的 PhysicalPlan 层可能被 Calcite RelNode 替代。但这个迁移工作量大，当前处于过渡期——三种引擎并存，通过 `SyntaxCheckException` 和 `shouldUseCalcite` 做路由和回退。
+
+### 0.6 当前路由逻辑（我们的扩展后）
+
+```
+POST /_plugins/_sql
+  │
+  ├─ 索引是 composite dataformat? ──YES──→ Unified Query API (Calcite 原生)
+  │
+  └─ NO → V2 引擎 AstBuilder
+       │
+       ├─ 普通查询 (SELECT/WHERE/GROUP BY/ORDER BY)
+       │    → V2 引擎 (Analyzer → Planner → PhysicalPlan)
+       │
+       ├─ 包含 UNION? (我们的扩展)
+       │    → Calcite 引擎 (CalciteRelNodeVisitor → RelNode)
+       │
+       └─ JOIN / IN 子查询? (AstBuilder 抛异常)
+            → 回退 Legacy V1 (Druid → SearchRequestBuilder)
+```
+
+---
+
 ## 第一部分：白盒实现分析
 
 ### 1.1 DSL 查询路径（直接路径）
