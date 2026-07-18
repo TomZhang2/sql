@@ -83,12 +83,14 @@ SQL/PPL 字符串
 ```
 
 **特征**：
-- **Calcite 优化器**：基于关系代数，支持算子下推、代价优化
-- **算子下推**：filter、aggregation、sort、limit 可下推到 OpenSearch 搜索引擎
-- **内存计算**：UNION 合并、未下推的 JOIN 等在内存中用 Enumerable 算子计算
+- **Calcite 优化器**：基于关系代数的 Volcano planner。注意：当前 OpenSearch 集成**未注入统计信息**（无 `RelMetadataProvider` 扩展），代价优化实际退化为规则系统。要发挥真正的 CBO 能力，需实现统计信息注入（参见第四部分 4.6 节）。
+- **算子下推**：通过 Calcite 的 `Convention` trait 机制驱动（`Logical` → `Enumerable` → `OpenSearchRel`）。filter、aggregation、sort、limit 可下推到 OpenSearch 搜索引擎。下推是规则驱动的，不是代价驱动的。
+- **Janino codegen**：Enumerable 算子通过 Janino 在运行时编译为 Java 字节码。首次执行每个查询形状有 ~10-50ms 编译开销，后续执行走已编译代码。50 轮预热可覆盖此成本，但生产中遇到新查询形状时仍需支付。
+- **内存计算**：UNION 合并、未下推的 JOIN 等在内存中用 Enumerable 算子计算（单节点单线程，无分布式并行）
 - **与 V2 共享 AST**：前端解析（ANTLR + AstBuilder）相同，从 `QueryService.shouldUseCalcite()` 开始分叉
 - **PPL 默认走此路径**：`plugins.calcite.enabled=true`（3.3.0 起默认），PPL 查询走 Calcite
 - **SQL 仅 UNION 走此路径**：我们的扩展让 `shouldUseCalcite` 检测到 Union 节点时路由到 Calcite（`containsUnion(plan)`）
+- **LogicalSystemLimit**：Calcite 路径默认加 `LogicalSystemLimit(fetch=plugins.query.size_limit)`，V2 路径无此限制
 
 **为什么 SQL 默认不走 Calcite？**
 `QueryService.shouldUseCalcite()` 中有硬编码限制：
@@ -310,7 +312,7 @@ OpenSearch 搜索引擎执行 → PrettyFormatRestExecutor → 响应
    - **Calcite 引擎**：仅 UNION/UNION ALL 走此路径（我们的扩展）；PPL 默认走此路径
    - **Legacy V1 引擎**：JOIN、IN 子查询回退到此路径（AstBuilder 抛 SyntaxCheckException 触发）
 
-3. **Calcite 的下推机制**：Calcite 会尽可能将操作下推到 OpenSearch（filter、aggregation、sort、limit），但某些操作必须在内存中执行（如 UNION 的合并、未下推的 JOIN）。
+3. **Calcite 的下推机制**：通过 Convention trait（`Logical` → `Enumerable` → `OpenSearchRel`）驱动，将 filter、aggregation、sort、limit 下推到 OpenSearch。下推是规则驱动的。不可下推的操作（如 UNION 合并、未下推的 JOIN）在内存中用 Enumerable 算子计算（单节点单线程，无分布式并行）。
 
 4. **游标实现不同**：
    - DSL 用 `search_after`（无状态，需要排序字段唯一）
@@ -321,6 +323,24 @@ OpenSearch 搜索引擎执行 → PrettyFormatRestExecutor → 响应
    - `search` 线程池：8 核机器上 13 线程（`int((cores * 3) / 2) + 1`）
    - `sql-worker` 线程池：8 核机器上 8 线程（`allocatedProcessors`）
    - 单线程测试无影响；并发测试时 DSL 有 62.5% 更多线程
+
+6. **计划缓存（重要警告）**：
+   - V2 和 Calcite 路径**均未实现按 SQL 字符串缓存编译计划**。每次查询都重新解析+规划。
+   - 但 ANTLR parser 内部可能有 token 缓存，Calcite 的 `CalcitePrepareImpl` 可能缓存 PreparedStatement。
+   - 基准测试中重复相同查询字符串会受益于任何隐式缓存，导致翻译开销被低估。
+   - **必须增加冷启动场景**（每轮用唯一注释 `/* :run_id */` 打散缓存）和**参数化场景**（同形状不同字面量）。
+
+7. **Calcite 内存计算风险**：
+   - Enumerable 算子在协调节点单线程执行，无分布式并行。
+   - 大数据量 UNION/JOIN（10k+ 行）可能导致 OOM。
+   - Presto/Spark 通过 exchange/shuffle 解决分布式执行，Calcite-on-OpenSearch 无此能力。
+   - 基准测试需增加大数据量内存压力场景。
+
+8. **OpenSearch 缓存影响公平性**：
+   - **request cache**：`size:0` 聚合请求被缓存。聚合场景 C1-C3 会被缓存主导。
+   - **filter cache**：`bool.filter` 条件被缓存。SQL 和 DSL 均可命中，但需验证生成的 DSL 形状一致。
+   - **query cache**：查询结果在 shard 级别缓存。
+   - 基准测试**必须禁用或随机化**这些缓存（见 3.2 节注意事项）。
 
 ---
 
@@ -426,13 +446,14 @@ CPU: 8 核
 磁盘: SSD 200GB
 网络: 本地回环（消除网络延迟）
 OS: macOS / Linux
-JDK: 21
+JDK: 21（启用 `-XX:+PrintCompilation` 监控 JIT 活动；启用 `-Xlog:gc*` 监控 GC）
 ```
 
-> ⚠️ **单 shard 局限性**：单 shard 消除了分布式协调开销，是 DSL 的最佳场景。
-> 生产环境通常 3-10 个 shard，多 shard 下 DSL 有 scatter-gather 开销但 SQL 翻译开销不变，
-> SQL 的相对开销比例会随 shard 数增加而下降。
-> 建议追加 3-shard 变体验证相对开销的稳定性。
+> ⚠️ **shard 数量选择**：
+> - **3-shard 1-replica 为主测试配置**（生产最小可用配置）
+> - 1-shard 为参考下限（DSL 最佳场景，SQL 开销占比上限）
+> - 多 shard 下 DSL 有 scatter-gather + merge 开销但 SQL 翻译开销不变，SQL 相对开销随 shard 数下降
+> - **1-shard 结论会系统性高估 SQL 劣势 2-3 倍**，不可作为生产推断依据
 
 #### 3.1.2 软件配置
 
@@ -467,8 +488,8 @@ index.max_result_window: 20000  ← 深度分页场景需要
     }
   },
   "settings": {
-    "number_of_shards": 1,
-    "number_of_replicas": 0,
+    "number_of_shards": 3,
+    "number_of_replicas": 1,
     "index.refresh_interval": "30s",
     "index.max_result_window": 20000
   }
@@ -611,28 +632,35 @@ SELECT * FROM perf_test WHERE MULTI_MATCH(message, 'request failed') AND level =
 
 #### 场景组 C：聚合查询
 
-**C1. 简单聚合**
+> ⚠️ **request cache 警告**：OpenSearch 缓存 `size:0` 聚合请求。基准测试中重复相同聚合会命中缓存，测到的是缓存查找（~0.5ms）而非聚合计算。
+> - DSL 请求必须加 `?request_cache=false` 参数
+> - SQL 请求需验证插件是否转发此参数；如不可控，**每轮使用不同的 WHERE 条件**（如 `WHERE response_time_ms > <random_threshold>`）打散缓存
+> - 分别报告 cache-hit 和 cache-miss 结果
+
+**C1. 简单聚合（随机化阈值打散缓存）**
 
 ```sql
--- SQL
-SELECT level, COUNT(*) as cnt FROM perf_test GROUP BY level;
+-- SQL — 每轮用不同阈值
+SELECT level, COUNT(*) as cnt FROM perf_test WHERE response_time_ms > {random_threshold} GROUP BY level;
 ```
 ```json
-// DSL
-{"size": 0, "aggs": {"by_level": {"terms": {"field": "level"}}}}
+// DSL — request_cache=false + 随机化
+// POST /perf_test/_search?request_cache=false
+{"size": 0, "query": {"range": {"response_time_ms": {"gt": <random_threshold>}}}, "aggs": {"by_level": {"terms": {"field": "level"}}}}
 ```
 
 **C2. 多级聚合（flat GROUP BY vs composite aggregation）**
 
 ```sql
--- SQL
+-- SQL — 每轮用不同阈值
 SELECT level, service, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt
 FROM perf_test
+WHERE response_time_ms > {random_threshold}
 GROUP BY level, service;
 ```
 ```json
-// DSL — 使用 composite 聚合与 SQL flat GROUP BY 语义对等
-{"size": 0, "aggs": {"by_level_service": {"composite": {"sources": [
+// DSL — request_cache=false + 随机化
+{"size": 0, "query": {"range": {"response_time_ms": {"gt": <random_threshold>}}}, "aggs": {"by_level_service": {"composite": {"sources": [
   {"level": {"terms": {"field": "level"}}},
   {"service": {"terms": {"field": "service"}}}
 ]}, "aggs": {"avg_rt": {"avg": {"field": "response_time_ms"}}}}}}
@@ -645,16 +673,16 @@ GROUP BY level, service;
 **C3. 范围聚合**
 
 ```sql
--- SQL
+-- SQL — 每轮用不同阈值
 SELECT service, COUNT(*) as cnt
 FROM perf_test
-WHERE response_time_ms > 1000
+WHERE response_time_ms > {random_threshold}
 GROUP BY service
 ORDER BY cnt DESC;
 ```
 ```json
-// DSL
-{"size": 0, "query": {"range": {"response_time_ms": {"gt": 1000}}}, "aggs": {
+// DSL — request_cache=false + 随机化
+{"size": 0, "query": {"range": {"response_time_ms": {"gt": <random_threshold>}}}, "aggs": {
   "by_service": {"terms": {"field": "service", "order": {"_count": "desc"}}}
 }}
 ```
@@ -778,6 +806,68 @@ WHERE host IN (SELECT host FROM perf_test WHERE level = 'ERROR')
 LIMIT 10;
 ```
 
+**E4. 大数据量 UNION ALL（内存压力测试，新增）**
+
+> 测试 Calcite Enumerable 算子在大量数据下的内存表现和 OOM 风险。
+> Calcite 内存计算在协调节点单线程执行，无分布式并行。
+
+```sql
+-- SQL — 每分支返回大量行（不做聚合，直接 UNION ALL）
+SELECT service, response_time_ms FROM perf_test WHERE status_code = 200
+UNION ALL
+SELECT service, response_time_ms FROM perf_test WHERE status_code = 301
+UNION ALL
+SELECT service, response_time_ms FROM perf_test WHERE status_code = 404;
+```
+```python
+# DSL 等价（3 次查询 + 应用层拼接）
+# 每次返回 ~12.5 万行（100 万 / 8）
+# 注意：应用层拼接也需要大量内存
+```
+
+> 监控指标：峰值 heap、GC 频率、是否触发 `plugins.query.memory_limit`。
+
+#### 场景组 F：辅助验证场景（新增）
+
+**F1. 冷启动 / 计划缓存场景**
+
+> 测试是否存在计划缓存，以及冷热计划延迟差异。
+
+```sql
+-- 每轮用唯一注释打散任何字符串级缓存
+SELECT /* cold_run_{timestamp} */ * FROM perf_test WHERE status_code = 200 LIMIT 10;
+```
+- 对比"冷启动"（每轮不同注释）与"热计划"（相同查询重复）的延迟差异
+- 如差异显著（>2ms），说明存在计划缓存，基准测试需区分冷热场景
+
+**F2. Pushdown on/off 对比（仅 Calcite 路径）**
+
+> 隔离 Calcite 规划开销与下推收益。
+
+```bash
+# 分别在 pushdown=true 和 pushdown=false 下运行 E1 (UNION ALL) 场景
+curl -X PUT "localhost:9200/_cluster/settings" -d '{"transient":{"plugins.calcite.pushdown.enabled":false}}'
+# 运行 E1 场景
+curl -X PUT "localhost:9200/_cluster/settings" -d '{"transient":{"plugins.calcite.pushdown.enabled":true}}'
+# 运行 E1 场景
+# 对比两者延迟差 = 下推收益
+```
+
+**F3. 结果集等价验证（所有场景前置步骤）**
+
+> TPC 标准要求：验证 SQL 和 DSL 返回相同结果集。
+
+```python
+def verify_results_match(sql_result, dsl_result):
+    """验证 SQL 和 DSL 结果集等价（行数、值、忽略顺序差异）"""
+    sql_rows = sorted([tuple(row) for row in sql_result['datarows']])
+    dsl_rows = sorted([tuple(hit['_source'].values()) for hit in dsl_result['hits']['hits']])
+    assert len(sql_rows) == len(dsl_rows), f"行数不匹配: SQL={len(sql_rows)}, DSL={len(dsl_rows)}"
+    for i, (s, d) in enumerate(zip(sql_rows, dsl_rows)):
+        assert s == d, f"第 {i} 行不匹配: SQL={s}, DSL={d}"
+    print("结果集验证通过")
+```
+
 ### 3.3 测试方法
 
 #### 3.3.1 压测工具
@@ -788,12 +878,13 @@ import requests
 import time
 import json
 import statistics
+import random
 
 BASE_URL = "http://localhost:9200"
-WARMUP_RUNS = 50      # ← 充分预热 JIT（原 5 轮不足）
-TEST_RUNS = 200       # ← 200 轮获得稳定 p99
+WARMUP_RUNS = 50      # 充分预热 JIT + Calcite codegen
+TEST_RUNS = 200       # 200 轮获得稳定 p99
 
-# 使用 Session 复用 TCP 连接（消除连接建立开销噪声）
+# 使用 Session 复用 TCP 连接
 session = requests.Session()
 
 def bench_sql(query, fetch_size=None):
@@ -803,15 +894,18 @@ def bench_sql(query, fetch_size=None):
     resp = session.post(f"{BASE_URL}/_plugins/_sql", json=body)
     return resp
 
-def bench_dsl(index, dsl):
-    resp = session.post(f"{BASE_URL}/{index}/_search", json=dsl)
+def bench_dsl(index, dsl, request_cache=False):
+    url = f"{BASE_URL}/{index}/_search"
+    if not request_cache:
+        url += "?request_cache=false"
+    resp = session.post(url, json=dsl)
     return resp
 
 def run_benchmark(name, func, *args, warmup=WARMUP_RUNS, runs=TEST_RUNS):
-    # Warmup
-    for _ in range(warmup):
+    # Warmup — 用滑动窗口 CV 判断预热是否完成
+    for i in range(warmup):
         func(*args)
-    
+
     # Test — 记录每次延迟用于异常值检测
     latencies = []
     for i in range(runs):
@@ -822,30 +916,62 @@ def run_benchmark(name, func, *args, warmup=WARMUP_RUNS, runs=TEST_RUNS):
             latencies.append(elapsed_ms)
         else:
             print(f"  ERROR (run {i}): {resp.status_code} {resp.text[:100]}")
-    
+
     if latencies:
         latencies.sort()
         p50 = statistics.median(latencies)
         p99 = latencies[int(len(latencies) * 0.99)]
+        p999 = latencies[int(len(latencies) * 0.999)] if len(latencies) > 100 else max(latencies)
         print(f"{name}:")
-        print(f"  avg={statistics.mean(latencies):.1f}ms  p50={p50:.1f}ms  p99={p99:.1f}ms  min={min(latencies):.1f}ms  max={max(latencies):.1f}ms")
-        # 输出 per-run 数据用于异常值分析
-        return latencies
-    return []
+        print(f"  avg={statistics.mean(latencies):.1f}ms  p50={p50:.1f}ms  p99={p99:.1f}ms  p99.9={p999:.1f}ms  min={min(latencies):.1f}ms  max={max(latencies):.1f}ms")
+        # 输出 per-run 数据用于 JIT/GC 异常值分析
+        return {"latencies": latencies, "p50": p50, "p99": p99, "p999": p999}
+    return {}
+
+def run_concurrent_benchmark(name, func, args_list, concurrency=8, duration_sec=60):
+    """并发吞吐量测试"""
+    import concurrent.futures
+    latencies = []
+    stop_time = time.time() + duration_sec
+
+    def worker():
+        local_latencies = []
+        while time.time() < stop_time:
+            start = time.perf_counter()
+            func(*random.choice(args_list))
+            local_latencies.append((time.perf_counter() - start) * 1000)
+        return local_latencies
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = [pool.submit(worker) for _ in range(concurrency)]
+        for f in concurrent.futures.as_completed(futures):
+            latencies.extend(f.result())
+
+    latencies.sort()
+    qps = len(latencies) / duration_sec
+    print(f"{name} (concurrency={concurrency}):")
+    print(f"  QPS={qps:.1f}  p50={statistics.median(latencies):.1f}ms  p99={latencies[int(len(latencies)*0.99)]:.1f}ms")
+    return {"qps": qps, "latencies": latencies}
 ```
 
 #### 3.3.2 执行步骤
 
 ```
-1. 启动 OpenSearch 集群
+1. 启动 OpenSearch 集群（3-shard, 1-replica, JIT/GC 日志开启）
 2. 创建索引（含 max_result_window: 20000）+ 导入 100 万数据
 3. 轮询等待索引完成（_cat/indices 确认 docs.count=1000000）
-4. 强制 merge 到 1 个 segment
-5. 预热查询（warmup 50 轮，让 JIT C2 编译 + ANTLR/Calcite classloader 初始化 + OS cache 填充）
-6. 正式测试（每个场景 200 轮，记录 per-run 延迟）
-7. 运行完整测试套件两遍（第一遍丢弃，验证 JIT 稳定性）
-8. 收集指标
-9. 清理
+4. 强制 merge 到 1 个 segment per shard
+5. 结果集等价验证（F3 场景）— 确认 SQL 和 DSL 返回相同结果
+6. 预热查询（warmup 50 轮，让 JIT C2 编译 + Calcite Janino codegen + OS cache 填充）
+   - 用滑动窗口 CV 判断预热是否完成（连续 3 个窗口 CV <5% 则完成）
+7. 正式测试（每个场景 200 轮，记录 per-run 延迟）
+   - 聚合场景用随机化阈值打散 request cache
+   - 同时运行冷启动场景 F1 对比
+8. 并发吞吐量测试（8/16/32 并发客户端，持续 60 秒）
+9. Pushdown on/off 对比测试（F2 场景，仅 Calcite 路径）
+10. 运行完整测试套件两遍（第一遍丢弃，验证 JIT 稳定性）
+11. 收集指标 + 关联 JIT/GC 日志分析异常值
+12. 清理
 ```
 
 #### 3.3.3 收集的指标
@@ -853,15 +979,22 @@ def run_benchmark(name, func, *args, warmup=WARMUP_RUNS, runs=TEST_RUNS):
 | 指标 | 收集方式 | 说明 |
 |------|---------|------|
 | **端到端延迟** | 客户端计时 | 从发送请求到收到响应的总时间 |
-| **p50 / p99 延迟** | 客户端统计（200 轮） | 中位数和 99 分位延迟 |
-| **per-run 延迟** | 客户端记录每次 | 用于检测 GC/JIT 异常值 |
-| **吞吐量 (QPS)** | 客户端统计 | 每秒完成请求数 |
-| **服务端查询耗时** | DSL: `profile:true`; SQL: 从 `_explain` 提取生成的 DSL 再 `profile:true` | 分离翻译开销和执行开销 |
-| **SQL explain 计划** | `_plugins/_sql/_explain` | 确认走 V2 / Calcite / Legacy V1 哪条路径 |
+| **p50 / p99 / p99.9 延迟** | 客户端统计（200 轮） | 中位数和尾部延迟 |
+| **per-run 延迟** | 客户端记录每次 | 用于关联 JIT 编译事件和 GC 暂停 |
+| **吞吐量 (QPS)** | 并发测试统计 | 8/16/32 并发客户端持续 60 秒 |
+| **服务端执行耗时** | OpenSearch slow log（`threshold.query.info: 0ms`） | **不使用** `_explain` 提取的 DSL（与实际执行 DSL 不一致） |
+| **翻译开销** | `SQL端到端延迟 - 服务端执行耗时(slowlog)` | 通过 slowlog 获取实际执行时间，而非 explain |
+| **SQL explain 计划** | `_plugins/_sql/_explain` | 确认走 V2 / Calcite / Legacy V1 哪条路径 + 下推情况 |
 | **Calcite 回退监控** | 服务端日志 | 检查 "Fallback to V2 query engine" 日志 |
-| **JVM heap 使用** | `_nodes/stats/jvm` | 量化内存差异（每个场景前后各采集一次） |
+| **JIT 编译事件** | `-XX:+PrintCompilation` 输出 | 关联延迟尖峰与 JIT 重编译 |
+| **JVM heap 使用** | `_nodes/stats/jvm` | 每场景前后采集 + 运行中持续采样 |
+| **JVM off-heap 内存** | `_nodes/stats/jvm`（`pools.direct`） | Calcite Enumerable 可能使用 direct buffer |
 | **GC 频率/耗时** | GC 日志 (`-Xlog:gc*`) | 检测 SQL 路径是否触发更多 GC |
-| **线程池状态** | `_nodes/stats/thread_pool` | sql-worker vs search 线程池利用率 |
+| **分配率** | GC 日志或 async-profiler | MB/s 分配速率，比 heap 快照更敏感 |
+| **线程池状态** | `_nodes/stats/thread_pool` | sql-worker vs search 线程池利用率（并发测试关键） |
+| **CPU 使用率** | 系统监控 | 进程级 CPU |
+| **结果集等价** | F3 验证函数 | 确认 SQL 和 DSL 返回相同结果（TPC 标准） |
+| **计划稳定性** | 1000 轮 diff explain 输出 | 检测 Calcite 规则应用是否确定性 |
 | **CPU 使用率** | 系统监控 | 进程级 CPU |
 
 ### 3.4 预期结果与分析框架
@@ -891,9 +1024,14 @@ def run_benchmark(name, func, *args, warmup=WARMUP_RUNS, runs=TEST_RUNS):
 1. **绝对延迟差异**：`SQL延迟 - DSL延迟`
 2. **相对开销比例**：`(SQL延迟 - DSL延迟) / DSL延迟 × 100%`
 3. **开销占比**：`翻译规划开销 / 总延迟 × 100%`（随查询变重而下降）
-4. **翻译开销分解**：`SQL总延迟 - profile提取的DSL执行时间 = 翻译开销`
-5. **p99 稳定性**：SQL 的解析层是否有 GC 抖动
-6. **内存影响**：`heap使用(SQL) - heap使用(DSL)`，定义"显著"为 >5% heap 增长
+4. **翻译开销分解**：`SQL端到端延迟 - 服务端slowlog执行耗时 = 翻译开销`
+   > ⚠️ **不使用** `_explain` 提取的 DSL 来测执行时间——explain 输出的 DSL 与实际执行的 DSL 可能不同（Calcite 下推在运行时才生成最终 DSL）。使用 OpenSearch slow log（`index.search.slowlog.threshold.query.info: 0ms`）获取实际服务端执行时间。
+5. **p99/p99.9 稳定性**：关联 per-run 延迟尖峰与 JIT 编译事件（`-XX:+PrintCompilation`）和 GC 暂停（`-Xlog:gc*`）
+6. **内存影响**：`heap使用(SQL) - heap使用(DSL)` + off-heap direct buffer 对比，定义"显著"为 >5% heap 增长
+7. **冷热计划对比**：F1 场景的冷启动 vs 热计划延迟差异，判断计划缓存影响
+8. **下推收益**：F2 场景 pushdown on/off 延迟差，量化下推的实际价值
+9. **并发性能**：不同并发度下的 QPS 和 p99，量化线程池差异影响
+10. **结果集等价**：F3 验证通过/失败，记录任何语义差异
 
 #### 3.4.3 预期结论框架
 
@@ -983,9 +1121,58 @@ python3 benchmark.py --tag pass1
 echo "=== 4. Run Benchmarks (second pass - keep) ==="
 python3 benchmark.py --tag pass2
 
-echo "=== 5. Cleanup ==="
+echo "=== 5. Result Equivalence Audit ==="
+python3 verify_results.py
+
+echo "=== 6. Cleanup ==="
 # curl -X DELETE "$ES/perf_test"
 ```
+
+### 3.7 架构风险与战略建议
+
+> 基于 Oracle 大数据查询引擎专家审视，以下风险和建议补充到基准测试的分析框架中。
+
+#### 3.7.1 架构风险
+
+| 风险 | 影响 | 缓解措施 |
+|------|------|---------|
+| **三引擎共存** | 语义漂移、路由复杂度增长、测试矩阵爆炸、性能不可预测 | 定义目标状态和截止日期（如"4.0 全走 Calcite，Legacy 移除"）；新功能只做 Calcite |
+| **Calcite 单节点内存瓶颈** | UNION/JOIN 的 Enumerable 算子在协调节点单线程执行，无分布式并行。100M 数据上会 OOM | E4 场景测量内存上限；文档化扩展边界；长期需 exchange/shuffle 机制 |
+| **无计划缓存** | 每次查询都重新解析+规划，高 QPS 下翻译开销累积 | 长期实现 PreparedStatement 缓存（Presto/Spark 有 30-50% 延迟优化） |
+| **无统计信息注入** | Calcite CBO 退化为规则系统，JOIN 计划选择随机 | 优先实现统计注入（10-15 人天），ROI 高于任何单一功能扩展 |
+| **游标不兼容** | V2 序列化游标 vs Calcite 无序列化游标，迁移破坏现有客户端 | 游标版本化 + 回退机制 |
+
+#### 3.7.2 SQL vs DSL 决策矩阵
+
+> 测试完成后，应产出以下决策矩阵供团队参考：
+
+| 查询形态 | QPS 层级 | 延迟预算 | 推荐 | 理由 |
+|---------|---------|---------|------|------|
+| 点查 (SELECT+WHERE) | 高 (>1000) | <10ms | DSL | 翻译开销占比高 |
+| 点查 (SELECT+WHERE) | 低 (<100) | <100ms | 均可 | 翻译开销可忽略 |
+| 聚合 (GROUP BY) | 中 | <200ms | 均可 | 翻译开销占比低 |
+| 全文搜索 | 高 | <10ms | DSL | SQL match() 功能受限 |
+| 全文搜索 | 低 | <100ms | DSL | 表达力更完整 |
+| JOIN | 任意 | 任意 | SQL | DSL 不支持 |
+| UNION | 任意 | 任意 | SQL | DSL 不支持 |
+| 复杂嵌套聚合 | 任意 | 任意 | DSL | SQL 表达力不足 |
+| BI 工具接入 | 任意 | 任意 | SQL | JDBC/ODBC 兼容 |
+| 跨数据源查询 | 任意 | 任意 | SQL | DSL 只能查本地索引 |
+
+#### 3.7.3 与行业最佳实践对比
+
+| 维度 | 本方案 | TPC-H/TPC-DS | JMH | Presto/Spark |
+|------|--------|-------------|-----|-------------|
+| 数据生成 | 自定义随机数据 | dbgen 规范化生成 | N/A | TPC 数据 |
+| 查询审计 | F3 结果等价验证 ✅ | 强制要求 | N/A | 内置 |
+| 规模扩展 | 1M（可扩展到 100M） | Scale Factor (SF) | N/A | 多 SF |
+| 功率测试 | 单线程 p50/p99 ✅ | Power test | Single shot | ✅ |
+| 吞吐测试 | 并发 QPS ✅ | Throughput test | N/A | ✅ |
+| JVM 隔离 | 两遍运行 | N/A | Fork per benchmark | N/A |
+| JIT 控制 | PrintCompilation ✅ | N/A | `-XX:-TieredCompilation` | N/A |
+| 分配 profiling | GC 日志 ✅ | N/A | `-prof gc` | N/A |
+
+> **差距**：缺少 TPC 标准的规范化数据生成和 Scale Factor 扩展。JMH 级别的 JVM 隔离（fork per benchmark）未实现，但两遍运行 + JIT 日志可部分替代。
 
 ---
 
@@ -1330,28 +1517,58 @@ Legacy:     L (Druid 有 CTE 语法但实现不完整)
 | P0-P3（覆盖大部分场景） | 19-31 |
 | P0-P5（全部） | 42-63 |
 
-### 4.6 关键洞察
+### 4.6 扩展模式分类
 
-UNION 扩展的"三步模式"可以复用到 JOIN 和 EXISTS 子查询：
+UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路由 → CalciteRelNodeVisitor 实现）仅适用于**计划级路由**的扩展。并非所有特性都适用此模式：
+
+| 扩展模式 | 适用特性 | 说明 |
+|---------|---------|------|
+| **计划级路由（三步模式）** | JOIN、EXISTS 子查询、3表+ JOIN | AstBuilder 构建节点 → shouldUseCalcite 检测 → CalciteRelNodeVisitor 已有实现 |
+| **函数注册** | COALESCE | 在 `BuiltinFunctionRepository` 注册函数，映射到 Calcite `SqlOperator` |
+| **聚合函数修复** | DATE_HISTOGRAM | 修复 INTERVAL 参数解析 NPE + 注册聚合函数 + 映射下推 |
+| **表达式级子查询** | 标量子查询 | 需 `AstExpressionBuilder` 新增方法 + Calcite `RexSubquery` 映射 + 子查询去关联 |
+| **语句级文法** | CTE | 新增文法规则 + AST 节点 + 作用域管理（或展开为派生表） |
+
+### 4.7 统计信息注入（最高杠杆独立工作流）
+
+> Oracle 专家审视发现：Calcite 优化器在无统计信息时退化为规则系统，JOIN 计划选择实际是随机的。
+
+**现状**：OpenSearch 有丰富的 per-shard 统计（doc_count、字段基数、min/max），但未注入 Calcite 的 `RelMetadataProvider`。
+
+**改动点**：
+- 在 `CalcitePlanContext.create()` 中注册自定义 `RelMetadataProvider`
+- 实现 `TableStats` / `RowCount` / `Selectivity` 元数据提供者
+- 从 OpenSearch `_stats` API 获取统计信息注入
+
+**工作量：10-15 人天**
+
+**ROI**：高于任何单一功能扩展。无统计时 Calcite CBO 实际是规则系统；有统计后 JOIN 计划选择有 2-10x 性能差异。
+
+### 4.8 依赖关系
 
 ```
-步骤 1: AstBuilder 中不抛异常，改为构建对应 AST 节点
-步骤 2: QueryService.shouldUseCalcite() 中新增检测条件，路由到 Calcite
-步骤 3: CalciteRelNodeVisitor 中已有实现（为 PPL 服务），确认可用
-```
-
-这两个特性（JOIN、EXISTS）的 Calcite 底层实现已经存在（为 PPL 服务），只需要打通 SQL → Calcite 的路由。
-
-**依赖关系**：
-
-```
-COALESCE ──────────────────────────────── 独立
-DATE_HISTOGRAM ────────────────────────── 独立
-EXISTS 子查询 ─────────────────────────── 独立
-3表+ JOIN ─────────────────────────────── 独立
+COALESCE ──────────────────────────────── 独立（函数注册模式）
+DATE_HISTOGRAM ────────────────────────── 独立（聚合函数修复模式）
+统计信息注入 ──────────────────────────── 独立（最高 ROI，建议优先）
+EXISTS 子查询 ─────────────────────────── 独立（计划级路由模式）
+3表+ JOIN ─────────────────────────────── 独立（计划级路由模式）
   ├── JOIN + GROUP BY ─────────────────── 依赖 3表+ JOIN
   ├── JOIN + 聚合函数 ─────────────────── 依赖 3表+ JOIN
   └── 子查询 + 外层 GROUP BY ──────────── 依赖 3表+ JOIN
-标量子查询 ────────────────────────────── 独立（但复杂度最高）
-CTE ───────────────────────────────────── 独立（可用派生表替代）
+标量子查询 ────────────────────────────── 独立（表达式级，复杂度最高）
+CTE ───────────────────────────────────── 独立（语句级，可用派生表替代）
 ```
+
+### 4.9 修订后的优先级
+
+| 优先级 | 特性 | 人天 | 模式 | 理由 |
+|:------:|------|:----:|------|------|
+| **P0** | 统计信息注入 | 10-15 | 独立工作流 | 最高 ROI，让 Calcite CBO 真正生效 |
+| **P1** | COALESCE | 1-2 | 函数注册 | 最简单，Calcite 原生支持 |
+| **P1** | DATE_HISTOGRAM | 3-5 | 聚合修复 | 修复 bug，时序分析基础能力 |
+| **P2** | 3表+ JOIN | 5-8 | 计划级路由 | 可复用 UNION 三步模式 |
+| **P2** | EXISTS 子查询 | 3-5 | 计划级路由 | SqlV2QueryParser 已有实现可参考 |
+| **P3** | JOIN + GROUP BY | 5-8 | 依赖 P2 | JOIN 走 Calcite 后自动获得 |
+| **P3** | 子查询 + 外层 GROUP BY | 5-8 | 依赖 P2 | 同上 |
+| **P4** | 标量子查询 | 8-12 | 表达式级 | 复杂度最高 |
+| **P5** | CTE | 10-15 | 语句级 | 可用派生表替代 |
