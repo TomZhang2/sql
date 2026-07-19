@@ -868,6 +868,240 @@ def verify_results_match(sql_result, dsl_result):
     print("结果集验证通过")
 ```
 
+### 3.2b 重查询场景设计
+
+> 前述 3.2 场景为轻查询（返回 ≤10 行，DSL 执行 <10ms），SQL 翻译开销占比 40-800%+。
+> 重查询场景通过高命中率 + 大结果集 + 高基数聚合 + 深度翻页，让 DSL 执行时间达到 100-400ms，
+> 使 SQL 翻译开销占比降至 <5%，验证"重查询下 SQL 与 DSL 基本持平"的预期。
+
+#### 设计原则
+
+```
+轻查询 → 重查询的转换公式:
+
+命中行数:  10 → 5000-10000+    (fetch 阶段耗时)
+聚合桶数:  4  → 1000+          (聚合计算耗时)
+翻页深度:  0  → 19990          (排序耗时)
+返回字段:  少量 → 全字段         (序列化耗时)
+排序复杂度: 无 → 多字段排序       (排序耗时)
+聚合指标:  1  → 4+             (多遍计算耗时)
+UNION分支: 2  → 3              (合并开销)
+JOIN行数:  10 → 10000+         (Hash Join 开销)
+```
+
+#### A 组（点查 → 重扫描 + 大结果集）
+
+**A1-H. 高命中 + 大结果集**
+
+```sql
+-- SQL — 命中 ~50% 数据(500K行)，返回 10000 行
+SELECT * FROM perf_test WHERE status_code = 200 ORDER BY response_time_ms DESC LIMIT 10000;
+```
+```json
+// DSL
+{"query":{"term":{"status_code":200}},"sort":[{"response_time_ms":"desc"}],"size":10000}
+```
+> 预期 DSL: 80-150ms（query 50ms + fetch 10K docs 50-100ms）
+
+**A2-H. 多条件高命中 + 大结果集**
+
+```sql
+-- SQL — 多条件 OR 命中大部分数据，返回 5000 行
+SELECT * FROM perf_test WHERE status_code IN (200, 301, 404) AND level IN ('INFO','WARN','ERROR') ORDER BY bytes DESC LIMIT 5000;
+```
+```json
+// DSL
+{"query":{"bool":{"filter":[{"terms":{"status_code":[200,301,404]}},{"terms":{"level":["INFO","WARN","ERROR"]}}]}},"sort":[{"bytes":"desc"}],"size":5000}
+```
+> 预期 DSL: 60-120ms
+
+**A3-H. 范围扫描高命中 + 大结果集**
+
+```sql
+-- SQL — 命中 ~60% 数据，返回 10000 行
+SELECT * FROM perf_test WHERE response_time_ms > 2000 ORDER BY `@timestamp` DESC LIMIT 10000;
+```
+```json
+// DSL
+{"query":{"range":{"response_time_ms":{"gt":2000}}},"sort":[{"@timestamp":"desc"}],"size":10000}
+```
+> 预期 DSL: 80-150ms
+
+#### B 组（全文搜索 → 高命中 + 大结果集）
+
+**B1-H. 高命中打分 + 大结果集**
+
+```sql
+-- SQL — match 命中大部分文档(~250K)，返回 5000 行
+SELECT message, service, level, response_time_ms FROM perf_test WHERE match(message, 'request') ORDER BY response_time_ms DESC LIMIT 5000;
+```
+```json
+// DSL
+{"query":{"match":{"message":"request"}},"sort":[{"response_time_ms":"desc"}],"size":5000,"_source":["message","service","level","response_time_ms"]}
+```
+> 预期 DSL: 60-120ms（打分 250K docs + fetch 5000）
+
+**B2-H. 多词打分 + filter + 大结果集**
+
+```sql
+-- SQL — 多词 match + filter，返回 10000 行
+SELECT * FROM perf_test WHERE match(message, 'request failed timeout') AND status_code >= 400 ORDER BY bytes DESC LIMIT 10000;
+```
+```json
+// DSL
+{"query":{"bool":{"must":[{"match":{"message":"request failed timeout"}}],"filter":[{"range":{"status_code":{"gte":400}}}]}},"sort":[{"bytes":"desc"}],"size":10000}
+```
+> 预期 DSL: 80-150ms
+
+#### C 组（聚合 → 高基数 + 多指标）
+
+**C1-H. 高基数聚合 + 多指标**
+
+```sql
+-- SQL — user_id 10000 个桶 + 4 个指标
+SELECT user_id, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt, MAX(bytes) as max_bytes, MIN(response_time_ms) as min_rt
+FROM perf_test
+WHERE response_time_ms > 100
+GROUP BY user_id
+ORDER BY cnt DESC
+LIMIT 1000;
+```
+```json
+// DSL
+{"size":0,"query":{"range":{"response_time_ms":{"gt":100}}},"aggs":{"by_user":{"terms":{"field":"user_id","size":1000,"order":{"cnt":"desc"}},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"max_bytes":{"max":{"field":"bytes"}},"min_rt":{"min":{"field":"response_time_ms"}}}}}}
+```
+> 预期 DSL: 100-300ms（10K 桶 + 4 指标聚合）
+
+**C2-H. 三级聚合 + 多指标 + percentile**
+
+```sql
+-- SQL — level×service×region = 100 组合 + 4 指标 + percentile
+SELECT level, service, region, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt, SUM(bytes) as total_bytes
+FROM perf_test
+WHERE response_time_ms > 500
+GROUP BY level, service, region
+ORDER BY level, cnt DESC;
+```
+```json
+// DSL — 使用 nested aggs（三级嵌套）
+{"size":0,"query":{"range":{"response_time_ms":{"gt":500}}},"aggs":{"by_level":{"terms":{"field":"level"},"aggs":{"by_service":{"terms":{"field":"service"},"aggs":{"by_region":{"terms":{"field":"region"},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"total_bytes":{"sum":{"field":"bytes"}},"p95":{"percentiles":{"field":"response_time_ms","percents":[95]}}}}}}}}}}
+```
+> 预期 DSL: 100-250ms（三级嵌套 + percentile 计算）
+> ⚠️ DSL 使用 nested aggs（树形），SQL 使用 flat GROUP BY（composite），执行路径不同，结果包含相同数据但结构不同
+
+**C3-H. 时间直方图 + 二级聚合（仅 DSL，SQL 不支持 DATE_HISTOGRAM）**
+
+```json
+// DSL — SQL 的 DATE_HISTOGRAM NPE，此场景仅测 DSL
+{"size":0,"aggs":{"by_hour":{"date_histogram":{"field":"@timestamp","calendar_interval":"1h"},"aggs":{"by_service":{"terms":{"field":"service"},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"p95":{"percentiles":{"field":"response_time_ms","percents":[95,99]}}}}}}}}
+```
+> 预期 DSL: 150-400ms（720 小时桶 × 5 service × percentile）
+
+#### D 组（分页 → 深度 + 大结果集）
+
+**D1-H. 极深度翻页**
+
+```sql
+-- SQL — 排序全部数据取最后 10 条
+SELECT * FROM perf_test ORDER BY response_time_ms ASC LIMIT 19990, 10;
+```
+```json
+// DSL
+{"query":{"match_all":{}},"sort":[{"response_time_ms":"asc"}],"from":19990,"size":10}
+```
+> 预期 DSL: 100-200ms（排序 20000 docs）
+
+**D2-H. 大结果集（10000 行）**
+
+```sql
+-- SQL — fetch 10000 行
+SELECT * FROM perf_test WHERE status_code = 200 ORDER BY response_time_ms DESC LIMIT 10000;
+```
+```json
+// DSL
+{"query":{"term":{"status_code":200}},"sort":[{"response_time_ms":"desc"}],"size":10000}
+```
+> 预期 DSL: 80-150ms
+
+**D3-H. 复合条件 + 大结果集**
+
+```sql
+-- SQL — 多条件 + 排序 + fetch 10000 行
+SELECT service, level, response_time_ms, bytes, `@timestamp` FROM perf_test WHERE response_time_ms > 1000 AND status_code IN (200, 500) ORDER BY response_time_ms DESC LIMIT 10000;
+```
+```json
+// DSL
+{"query":{"bool":{"filter":[{"range":{"response_time_ms":{"gt":1000}}},{"terms":{"status_code":[200,500]}}]}},"sort":[{"response_time_ms":"desc"}],"size":10000,"_source":["service","level","response_time_ms","bytes","@timestamp"]}
+```
+> 预期 DSL: 80-150ms
+
+#### E 组（SQL 独有 → 大数据量 UNION/JOIN）
+
+**E1-H. 三路 UNION ALL + 聚合**
+
+```sql
+-- SQL — 三路聚合 UNION ALL
+SELECT service, COUNT(*) as cnt FROM perf_test WHERE level = 'ERROR' GROUP BY service
+UNION ALL
+SELECT service, COUNT(*) as cnt FROM perf_test WHERE level = 'WARN' GROUP BY service
+UNION ALL
+SELECT service, COUNT(*) as cnt FROM perf_test WHERE level = 'DEBUG' GROUP BY service;
+```
+> 预期 SQL (Calcite pushdown ON): 20-50ms（3 次下推聚合 + 合并 15 行）
+
+**E1b-H. UNION ALL 大结果集（不做聚合）**
+
+```sql
+-- SQL — ~250K 行内存合并
+SELECT service, response_time_ms FROM perf_test WHERE status_code = 500
+UNION ALL
+SELECT service, response_time_ms FROM perf_test WHERE status_code = 503;
+```
+> 预期 SQL: 100-300ms（内存合并 250K 行）
+> ⚠️ 监控 OOM 风险
+
+**E2-H. JOIN 大结果集**
+
+```sql
+-- SQL — ~250K 行 Hash Join
+SELECT a.service, a.level, a.response_time_ms, b.dept_name
+FROM perf_test a
+JOIN perf_test_meta b ON a.host = b.host
+WHERE a.level = 'ERROR'
+LIMIT 10000;
+```
+> 预期 SQL (Legacy V1): 200-500ms
+
+**E3-H. IN 子查询大结果集**
+
+```sql
+-- SQL — 大表 IN 子查询
+SELECT service, level, response_time_ms FROM perf_test
+WHERE host IN (SELECT host FROM perf_test WHERE level = 'ERROR')
+LIMIT 10000;
+```
+> 预期 SQL (Legacy V1): 200-500ms
+
+#### 重查询预期结果矩阵
+
+| 场景 | 预期 DSL (ms) | 预期 SQL 翻译开销 (ms) | 预期开销占比 | 设计要点 |
+|------|:---:|:---:|:---:|------|
+| A1-H | 80-150 | 1-3 | 1-3% | 500K 命中 + fetch 10K |
+| A2-H | 60-120 | 2-5 | 2-5% | 多条件 + fetch 5K |
+| A3-H | 80-150 | 1-3 | 1-3% | 600K 命中 + fetch 10K |
+| B1-H | 60-120 | 1-3 | 1-4% | 250K 打分 + fetch 5K |
+| B2-H | 80-150 | 2-5 | 2-5% | 多词打分 + fetch 10K |
+| C1-H | 100-300 | 5-15 | 2-7% | 10K 桶 + 4 指标 |
+| C2-H | 100-250 | 5-15 | 3-10% | 三级嵌套 + percentile |
+| C3-H | 150-400 | — | — | DSL only |
+| D1-H | 100-200 | 1-3 | 1-2% | from:19990 |
+| D2-H | 80-150 | 1-3 | 1-3% | fetch 10K |
+| D3-H | 80-150 | 2-5 | 2-5% | 多条件 + fetch 10K |
+| E1-H | — | 20-50 | — | 3路聚合UNION |
+| E1b-H | — | 100-300 | — | 250K行UNION合并 |
+| E2-H | — | 200-500 | — | 大表JOIN |
+| E3-H | — | 200-500 | — | 大表IN子查询 |
+
 ### 3.3 测试方法
 
 #### 3.3.1 压测工具
