@@ -146,7 +146,7 @@ A1: 0.5ms → 20.7ms  (开销增大，但 DSL 也变重，占比从 63% 降到 1
 A2: 0.9ms → 64.5ms  (开销增大，但 DSL 太快，占比从 45% 升到 200% ❌)
 B1: 0.4ms → 16.5ms  (开销增大，占比从 67% 降到 54% ✅)
 C1: 11.3ms → 29.4ms (开销增大，占比从 807% 降到 161% ✅)
-C2: 19.7ms → -37.3ms (SQL 反而比 DSL 快！composite 聚合优势 ✅)
+C2: 19.7ms → -37.3ms (SQL 反而比 DSL 快！⚠️ 但查询不等价+缓存污染，待重测)
 D2: 10.2ms → 73.1ms (开销增大，占比 104%→123%，JdbcResponseFormatter 开销 ⚠️)
 ```
 
@@ -160,9 +160,17 @@ DSL 在单节点 + forcemerge + 512MB heap 环境下异常快（6-60ms），远�
 
 **建议**：在多节点 + 3+ shard + 未 forcemerge 的环境上重测，DSL 绝对延迟会上升，SQL 相对开销比例会下降。
 
-### 5.2 🔴 C2-H SQL 反而比 DSL 快 95%
+### 5.2 ⚠️ C2-H SQL 比 DSL 快 95% — 数据可信度存疑
 
-SQL V2 的 `composite` 聚合（flat GROUP BY）比 DSL 的 nested `aggs`（三级嵌套 terms）高效得多。这是 SQL 的意外优势——**多级 GROUP BY 场景应优先使用 SQL**。
+**原结论**：SQL V2 的 `composite` 聚合比 DSL 的 nested `aggs` 高效得多。
+
+**修正**：经手动验证和 Oracle 审视，此结论**不可靠**，原因有二：
+
+1. **查询不等价**：DSL 的 C2-H 查询包含 `percentile`（tdigest，计算开销大），SQL 的 composite 聚合仅计算 COUNT + AVG（通过 `_explain` 确认，无 percentile）。去掉 DSL 的 percentile 后，DSL 从 39.4ms 降至 ~19ms（手动验证），差距大幅缩小。
+
+2. **filter cache 污染**：SQL 路径不尊守 `request_cache=false`，重复相同查询时 filter cache 命中。手动验证：SQL 首次执行 249ms → 后续 34-37ms。基准测试中 2.1ms 可能是缓存命中后的结果。
+
+**修正后结论**：多级聚合场景 SQL composite 与 DSL nested aggs 的性能对比**需要重新测试**（SQL 加随机阈值打散缓存 + DSL 去掉 percentile）。不宜声称 "SQL 结构性优势"。
 
 ### 5.3 🟡 大结果集的 JdbcResponseFormatter 开销显著
 
@@ -189,7 +197,7 @@ D2-H（10K 行）SQL 132ms vs DSL 59ms，差异 73ms。其中 JdbcResponseFormat
 | 高命中全文搜索 (5K行) | 47 | 30 | 54% | 均可 |
 | 多词全文搜索 (10K行) | 133 | 57 | 134% | **DSL** |
 | 高基数聚合 (10K桶) | 48 | 18 | 161% | **DSL** |
-| **多级聚合 (100桶)** | **2.1** | **39.4** | **-95%** | **SQL！** |
+| **多级聚合 (100桶)** | **2.1**¹ | **39.4**² | **-95%**¹² | **待重测** |
 | 深度翻页 (19990) | 23 | 6 | 262% | **DSL** |
 | 大结果集 (10K行) | 132 | 59 | 123% | **DSL** |
 | UNION ALL+聚合 (pushdown ON) | 14 | — | — | **SQL 唯一选择** |
@@ -201,9 +209,9 @@ D2-H（10K 行）SQL 132ms vs DSL 59ms，差异 73ms。其中 JdbcResponseFormat
 
 1. **重查询不一定能让 SQL 开销占比 <5%**——取决于 DSL 在测试环境中的绝对速度。单节点环境 DSL 异常快，需要多节点环境验证。
 
-2. **C2-H 多级聚合是 SQL 的亮点**——SQL `composite` 聚合比 DSL nested `aggs` 快 19 倍。这是 SQL 的结构性优势。
+2. **C2-H 多级聚合的 "SQL 优势" 不可靠**——DSL 查询包含 percentile（SQL 没有），且 SQL 受 filter cache 污染。需重新测试后才能下结论。
 
-3. **大结果集（10K 行）的 JdbcResponseFormatter 开销约 40-60ms**——这是 SQL 独有的格式化开销，DSL 无此问题。返回大量行时应优先用 DSL。
+3. **大结果集（10K 行）的 JdbcResponseFormatter 开销约 40-60ms（估算值，未实测）**——这是 SQL 独有的格式化开销，DSL 无此问题。返回大量行时应优先用 DSL。
 
 4. **UNION ALL + 聚合在 pushdown ON 时性能优秀（14ms）**——pushdown 将 3 个子查询的聚合下推到 OpenSearch，仅合并 15 行结果。
 

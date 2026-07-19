@@ -222,6 +222,30 @@
 5. **长期需实现统计信息注入**，让 Calcite CBO 真正生效（当前 pushdown 是规则驱动，非代价驱动）。
 6. **单节点 512MB heap 是限制因素**，生产环境（8GB+ heap）的绝对延迟会更低，但相对开销比例应相似。
 
+### 5.5 数据修正与可信度说明
+
+> 经 Oracle 大数据专家深度审视和手动验证，以下数据需修正或标注限制：
+
+**1. SQL 聚合场景的 filter cache 污染（影响 C1-C3）**
+
+SQL 路径经 `_plugins/_sql` 走 PIT 机制，OpenSearch 的 **filter cache 对 SQL 请求仍生效**。基准测试中 C1-C3 虽然使用了随机阈值打散 request cache，但 filter cache（缓存 `bool.filter` 条件结果）仍可能命中。
+
+手动验证证实：SQL 重复相同聚合查询，首次 249ms → 后续 34-37ms（filter cache 命中）。因此 C1-C3 的 SQL 数据（12.7-27.4ms）可能部分受益于 filter cache，实际冷查询 SQL 延迟可能更高。
+
+**2. SQL 翻译开销范围**
+
+报告中 "0.4-0.9ms（简单查询）" 和 "11-20ms（聚合）" 是直接测量的端到端差异，**包含翻译开销 + 可能的缓存效应 + JdbcResponseFormatter 开销**，不能简单等同于"翻译开销"。
+
+更准确的表述：SQL 的总额外开销（翻译+格式化+缓存差异）范围为 **0.4-20ms**，与查询复杂度正相关，**非固定值**。
+
+**3. B2 全文搜索 SQL 快于 DSL 的可信度**
+
+B2 的 DSL 查询使用 `bool.must`（打分）+ `bool.filter`（不打分）组合。SQL 的 `match()` 生成 `match` query（打分），`level = 'ERROR'` 生成 `bool.filter`（不打分）。如果 DSL 查询中 `level` 条件误用了 `must` 而非 `filter`，DSL 会额外打分导致变慢。此结论的公平性取决于 DSL 查询编写质量，**不宜作为 SQL 结构性优势的依据**。
+
+**4. E1 pushdown 状态不确定**
+
+E1（11265ms）与 F2_PUSH_OFF（11319ms）几乎相同，说明 E1 运行时 pushdown 可能未生效。F2_PUSH_ON（5.7ms）是单独验证的结果。E1 的数据**不应作为 UNION ALL 的代表性性能**，应使用 F2_PUSH_ON 的 5.7ms。
+
 ---
 
 ## 附录：测试数据说明
