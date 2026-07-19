@@ -238,52 +238,52 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 #### A 组：点查
 
-| 场景 | SQL | DSL |
-|------|-----|-----|
-| A1 等值(单条件) | `SELECT * FROM perf_test WHERE status_code=200 LIMIT 10` | `{"term":{"status_code":200},"size":10}` |
-| A2 等值(多条件) | `WHERE status_code=500 AND level='ERROR' AND region='us-east-1' LIMIT 10` | `bool.filter` 3 个 term |
-| A3 范围 | `WHERE response_time_ms>3000 AND status_code=500 LIMIT 10` | `bool.filter` range+term |
+| 场景 | SQL 查询 | DSL 查询 |
+|------|---------|---------|
+| A1 等值(单条件) | `SELECT * FROM perf_test WHERE status_code = 200 LIMIT 10` | `{"query":{"term":{"status_code":200}},"size":10}` |
+| A2 等值(多条件) | `SELECT * FROM perf_test WHERE status_code = 500 AND level = 'ERROR' AND region = 'us-east-1' LIMIT 10` | `{"query":{"bool":{"filter":[{"term":{"status_code":500}},{"term":{"level":"ERROR"}},{"term":{"region":"us-east-1"}}]}},"size":10}` |
+| A3 范围 | `SELECT * FROM perf_test WHERE response_time_ms > 3000 AND status_code = 500 LIMIT 10` | `{"query":{"bool":{"filter":[{"range":{"response_time_ms":{"gt":3000}}},{"term":{"status_code":500}}]}},"size":10}` |
 
 #### B 组：全文搜索
 
-| 场景 | SQL | DSL |
-|------|-----|-----|
-| B1 简单 | `WHERE match(message,'timeout') LIMIT 10` | `{"match":{"message":"timeout"}}` |
-| B2 多字段 | `WHERE MULTI_MATCH(message,'request failed') AND level='ERROR' LIMIT 10` | `bool.must(match)+filter(term)` |
+| 场景 | SQL 查询 | DSL 查询 |
+|------|---------|---------|
+| B1 简单 | `SELECT message, service FROM perf_test WHERE match(message, 'timeout') LIMIT 10` | `{"query":{"match":{"message":"timeout"}},"size":10,"_source":["message","service"]}` |
+| B2 多字段 | `SELECT * FROM perf_test WHERE MULTI_MATCH(message, 'request failed') AND level = 'ERROR' LIMIT 10` | `{"query":{"bool":{"must":[{"match":{"message":"request failed"}}],"filter":[{"term":{"level":"ERROR"}}]}},"size":10}` |
 
 #### C 组：聚合（随机阈值打散缓存）
 
-| 场景 | SQL | DSL |
-|------|-----|-----|
-| C1 简单 | `SELECT level,COUNT(*) WHERE response_time_ms>{random} GROUP BY level` | `terms` agg |
-| C2 多级 | `SELECT level,service,COUNT(*),AVG(rt) WHERE rt>{random} GROUP BY level,service` | `composite` agg（与 SQL flat GROUP BY 对等） |
-| C3 范围+排序 | `SELECT service,COUNT(*) WHERE rt>{random} GROUP BY service ORDER BY COUNT(*) DESC` | `terms` agg with order |
-| C4 时间直方图 | SQL 不支持（NPE） | DSL `date_histogram`（仅 DSL） |
+| 场景 | SQL 查询 | DSL 查询 |
+|------|---------|---------|
+| C1 简单 | `SELECT level, COUNT(*) as cnt FROM perf_test WHERE response_time_ms > {random} GROUP BY level` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":{random}}}},"aggs":{"by_level":{"terms":{"field":"level"}}}}` |
+| C2 多级 | `SELECT level, service, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt FROM perf_test WHERE response_time_ms > {random} GROUP BY level, service` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":{random}}}},"aggs":{"ls":{"composite":{"sources":[{"level":{"terms":{"field":"level"}}},{"service":{"terms":{"field":"service"}}}]},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}}}}}}` |
+| C3 范围+排序 | `SELECT service, COUNT(*) as cnt FROM perf_test WHERE response_time_ms > {random} GROUP BY service ORDER BY cnt DESC` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":{random}}}},"aggs":{"by_service":{"terms":{"field":"service","order":{"_count":"desc"}}}}}` |
+| C4 时间直方图 | SQL 不支持（DATE_HISTOGRAM NPE） | `{"size":0,"aggs":{"by_hour":{"date_histogram":{"field":"@timestamp","calendar_interval":"1h"}}}}` |
 
 #### D 组：排序与分页
 
-| 场景 | SQL | DSL |
-|------|-----|-----|
-| D1 排序+小分页 | `ORDER BY response_time_ms DESC LIMIT 10` | `sort` + `size:10` |
-| D2 深度分页 | `LIMIT 10000,10`（需 max_result_window:20000） | `from:10000,size:10` |
-| D3 大结果集 | `WHERE status_code=200 LIMIT 1000` | `term` + `size:1000` |
-| D4 游标分页 | `fetch_size:100` 多页 | `search_after` 多页 |
+| 场景 | SQL 查询 | DSL 查询 |
+|------|---------|---------|
+| D1 排序+小分页 | `SELECT * FROM perf_test ORDER BY response_time_ms DESC LIMIT 10` | `{"query":{"match_all":{}},"sort":[{"response_time_ms":"desc"}],"size":10}` |
+| D2 深度分页 | `SELECT * FROM perf_test ORDER BY response_time_ms DESC LIMIT 10000, 10` | `{"query":{"match_all":{}},"sort":[{"response_time_ms":"desc"}],"from":10000,"size":10}` |
+| D3 大结果集 | `SELECT * FROM perf_test WHERE status_code = 200 LIMIT 1000` | `{"query":{"term":{"status_code":200}},"size":1000}` |
+| D4 游标分页 | `{"query":"SELECT * FROM perf_test WHERE status_code = 200","fetch_size":100}` | `{"query":{"term":{"status_code":200}},"sort":[{"_id":"asc"}],"size":100}` + `search_after` |
 
 #### E 组：SQL 独有（无 DSL 对照）
 
-| 场景 | SQL | 引擎 |
-|------|-----|------|
-| E1 UNION ALL+聚合 | 两路聚合 UNION ALL | Calcite |
-| E2 2表JOIN | `JOIN perf_test_meta ON host` | Legacy V1 |
-| E3 IN子查询 | `WHERE host IN (SELECT...)` | Legacy V1 |
+| 场景 | SQL 查询 | DSL 等价（多次查询+应用层合并） | 引擎 |
+|------|---------|------|------|
+| E1 UNION ALL+聚合 | `SELECT service, COUNT(*) as cnt FROM perf_test WHERE level = 'ERROR' GROUP BY service UNION ALL SELECT service, COUNT(*) as cnt FROM perf_test WHERE level = 'WARN' GROUP BY service` | 2 次 `terms` agg + 应用层合并 | Calcite |
+| E2 2表JOIN | `SELECT a.service, a.level, b.host_name FROM perf_test a JOIN perf_test_meta b ON a.host = b.host WHERE a.level = 'ERROR' LIMIT 10` | 先查 perf_test 获取 host 列表，再查 perf_test_meta，应用层关联 | Legacy V1 |
+| E3 IN子查询 | `SELECT * FROM perf_test WHERE host IN (SELECT host FROM perf_test WHERE level = 'ERROR') LIMIT 10` | 先查子查询获取 host 列表，再用 terms 查询 | Legacy V1 |
 
 #### F 组：辅助验证
 
-| 场景 | 说明 |
-|------|------|
-| F1 冷启动 | 每轮唯一注释 `/* cold_run_{ts} */` 打散计划缓存 |
-| F2 Pushdown on/off | 对比 Calcite 下推开关，隔离下推收益 |
-| F3 结果等价 | 验证 SQL 和 DSL 返回相同结果（TPC 标准） |
+| 场景 | SQL 查询 | 说明 |
+|------|---------|------|
+| F1 冷启动 | `SELECT /* cold_run_{timestamp} */ * FROM perf_test WHERE status_code = 200 LIMIT 10` | 每轮唯一注释打散计划缓存 |
+| F2 Pushdown on/off | 同 E1 查询，分别 `plugins.calcite.pushdown.enabled=true/false` | 隔离下推收益 |
+| F3 结果等价 | 对每个场景的 SQL 和 DSL 结果集做行数+值比对 | TPC 标准 |
 
 ### 4.3 重查询场景（1M 数据，返回 5K-10K 行）
 
@@ -291,43 +291,43 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 #### A-H 组：大结果集点查
 
-| 场景 | SQL | DSL | 预期 DSL |
-|------|-----|-----|:---:|
-| A1-H | `WHERE status_code=200 ORDER BY rt DESC LIMIT 10000` | term+sort+size:10K | 80-150ms |
-| A2-H | `WHERE status_code IN(...) AND level IN(...) ORDER BY bytes DESC LIMIT 5000` | terms+sort+size:5K | 60-120ms |
-| A3-H | `WHERE rt>2000 ORDER BY @timestamp DESC LIMIT 10000` | range+sort+size:10K | 80-150ms |
+| 场景 | SQL 查询 | DSL 查询 | 预期 DSL |
+|------|---------|---------|:---:|
+| A1-H | `SELECT * FROM perf_test WHERE status_code = 200 ORDER BY response_time_ms DESC LIMIT 10000` | `{"query":{"term":{"status_code":200}},"sort":[{"response_time_ms":"desc"}],"size":10000}` | 80-150ms |
+| A2-H | `SELECT * FROM perf_test WHERE status_code IN (200, 301, 404) AND level IN ('INFO','WARN','ERROR') ORDER BY bytes DESC LIMIT 5000` | `{"query":{"bool":{"filter":[{"terms":{"status_code":[200,301,404]}},{"terms":{"level":["INFO","WARN","ERROR"]}}]}},"sort":[{"bytes":"desc"}],"size":5000}` | 60-120ms |
+| A3-H | `SELECT * FROM perf_test WHERE response_time_ms > 2000 ORDER BY \`@timestamp\` DESC LIMIT 10000` | `{"query":{"range":{"response_time_ms":{"gt":2000}}},"sort":[{"@timestamp":"desc"}],"size":10000}` | 80-150ms |
 
 #### B-H 组：高命中全文搜索
 
-| 场景 | SQL | DSL | 预期 DSL |
-|------|-----|-----|:---:|
-| B1-H | `WHERE match(message,'request') ORDER BY rt DESC LIMIT 5000` | match+sort+size:5K | 60-120ms |
-| B2-H | `WHERE match(message,'request failed timeout') AND status_code>=400 ORDER BY bytes DESC LIMIT 10000` | bool+sort+size:10K | 80-150ms |
+| 场景 | SQL 查询 | DSL 查询 | 预期 DSL |
+|------|---------|---------|:---:|
+| B1-H | `SELECT message, service, level, response_time_ms FROM perf_test WHERE match(message, 'request') ORDER BY response_time_ms DESC LIMIT 5000` | `{"query":{"match":{"message":"request"}},"sort":[{"response_time_ms":"desc"}],"size":5000,"_source":["message","service","level","response_time_ms"]}` | 60-120ms |
+| B2-H | `SELECT * FROM perf_test WHERE match(message, 'request failed timeout') AND status_code >= 400 ORDER BY bytes DESC LIMIT 10000` | `{"query":{"bool":{"must":[{"match":{"message":"request failed timeout"}}],"filter":[{"range":{"status_code":{"gte":400}}}]}},'sort":[{"bytes":"desc"}],"size":10000}` | 80-150ms |
 
 #### C-H 组：高基数聚合
 
-| 场景 | SQL | DSL | 预期 DSL |
-|------|-----|-----|:---:|
-| C1-H | `GROUP BY user_id(100K桶) + 4指标 LIMIT 1000` | terms(size:1000)+4 sub-aggs | 100-300ms |
-| C2-H | `GROUP BY level,service,region(100桶) + 多指标` | nested aggs + percentile | 100-250ms |
-| C3-H | SQL 不支持 | `date_histogram` + 二级聚合 | 150-400ms（仅 DSL） |
+| 场景 | SQL 查询 | DSL 查询 | 预期 DSL |
+|------|---------|---------|:---:|
+| C1-H | `SELECT user_id, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt, MAX(bytes) as max_bytes, MIN(response_time_ms) as min_rt FROM perf_test WHERE response_time_ms > 100 GROUP BY user_id ORDER BY cnt DESC LIMIT 1000` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":100}}},"aggs":{"by_user":{"terms":{"field":"user_id","size":1000,"order":{"_count":"desc"}},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"max_bytes":{"max":{"field":"bytes"}},"min_rt":{"min":{"field":"response_time_ms"}}}}}}` | 100-300ms |
+| C2-H | `SELECT level, service, region, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt, SUM(bytes) as total_bytes FROM perf_test WHERE response_time_ms > 500 GROUP BY level, service, region ORDER BY level, cnt DESC` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":500}}},"aggs":{"by_level":{"terms":{"field":"level"},"aggs":{"by_service":{"terms":{"field":"service"},"aggs":{"by_region":{"terms":{"field":"region"},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"total_bytes":{"sum":{"field":"bytes"}}}}}}}}}}` | 100-250ms |
+| C3-H | SQL 不支持（DATE_HISTOGRAM NPE） | `{"size":0,"aggs":{"by_hour":{"date_histogram":{"field":"@timestamp","calendar_interval":"1h"},"aggs":{"by_service":{"terms":{"field":"service"},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"p95":{"percentiles":{"field":"response_time_ms","percents":[95,99]}}}}}}}}` | 150-400ms |
 
 #### D-H 组：深度分页 + 大结果集
 
-| 场景 | SQL | DSL | 预期 DSL |
-|------|-----|-----|:---:|
-| D1-H | `ORDER BY rt ASC LIMIT 19990,10` | sort+from:19990 | 100-200ms |
-| D2-H | `WHERE status_code=200 ORDER BY rt DESC LIMIT 10000` | term+sort+size:10K | 80-150ms |
-| D3-H | `WHERE rt>1000 AND status_code IN(200,500) ORDER BY rt DESC LIMIT 10000` | bool+sort+size:10K | 80-150ms |
+| 场景 | SQL 查询 | DSL 查询 | 预期 DSL |
+|------|---------|---------|:---:|
+| D1-H | `SELECT * FROM perf_test ORDER BY response_time_ms ASC LIMIT 19990, 10` | `{"query":{"match_all":{}},"sort":[{"response_time_ms":"asc"}],"from":19990,"size":10}` | 100-200ms |
+| D2-H | `SELECT * FROM perf_test WHERE status_code = 200 ORDER BY response_time_ms DESC LIMIT 10000` | `{"query":{"term":{"status_code":200}},"sort":[{"response_time_ms":"desc"}],"size":10000}` | 80-150ms |
+| D3-H | `SELECT service, level, response_time_ms, bytes, \`@timestamp\` FROM perf_test WHERE response_time_ms > 1000 AND status_code IN (200, 500) ORDER BY response_time_ms DESC LIMIT 10000` | `{"query":{"bool":{"filter":[{"range":{"response_time_ms":{"gt":1000}}},{"terms":{"status_code":[200,500]}}]}},"sort":[{"response_time_ms":"desc"}],"size":10000,"_source":["service","level","response_time_ms","bytes","@timestamp"]}` | 80-150ms |
 
 #### E-H 组：SQL 独有大数据量
 
-| 场景 | SQL | 引擎 | 预期 SQL |
-|------|-----|------|:---:|
-| E1-H 三路UNION+聚合 | 3 路聚合 UNION ALL | Calcite | 20-50ms |
-| E1b-H 250K行UNION | 两路大结果集 UNION ALL | Calcite | 100-300ms |
-| E2-H JOIN 10K行 | `JOIN perf_test_meta LIMIT 10000` | Legacy V1 | 200-500ms |
-| E3-H IN子查询 10K行 | `WHERE host IN (SELECT...) LIMIT 10000` | Legacy V1 | 200-500ms |
+| 场景 | SQL 查询 | 引擎 | 预期 SQL |
+|------|---------|------|:---:|
+| E1-H 三路UNION+聚合 | `SELECT service, COUNT(*) as cnt FROM perf_test WHERE level = 'ERROR' GROUP BY service UNION ALL SELECT service, COUNT(*) as cnt FROM perf_test WHERE level = 'WARN' GROUP BY service UNION ALL SELECT service, COUNT(*) as cnt FROM perf_test WHERE level = 'DEBUG' GROUP BY service` | Calcite | 20-50ms |
+| E1b-H 250K行UNION | `SELECT service, response_time_ms FROM perf_test WHERE status_code = 500 UNION ALL SELECT service, response_time_ms FROM perf_test WHERE status_code = 503` | Calcite | 100-300ms |
+| E2-H JOIN 10K行 | `SELECT a.service, a.level, a.response_time_ms, b.dept_name FROM perf_test a JOIN perf_test_meta b ON a.host = b.host WHERE a.level = 'ERROR' LIMIT 10000` | Legacy V1 | 200-500ms |
+| E3-H IN子查询 10K行 | `SELECT service, level, response_time_ms FROM perf_test WHERE host IN (SELECT host FROM perf_test WHERE level = 'ERROR') LIMIT 10000` | Legacy V1 | 200-500ms |
 
 ### 4.4 10M 多节点生产级验证方案
 
@@ -344,20 +344,20 @@ slowlog 开启（threshold.query.info: 0ms）
 
 #### 场景组 G：生产典型重查询
 
-| 场景 | SQL | DSL | 预期 DSL |
-|------|-----|-----|:---:|
-| G1 时间范围+聚合 | 7 天数据按 service×level 聚合 | range+nested aggs | 300-600ms |
-| G2 多字段排序+10K | ERROR 日志多字段排序 | bool+sort+size:10K | 200-500ms |
-| G3 高基数聚合+过滤 | 按 user_id(100K桶) 聚合 Top1000 | terms(size:1000)+4 aggs | 300-600ms |
-| G4 复合+5K | 多条件+排序+5000 行 | bool+sort+size:5K | 150-400ms |
+| 场景 | SQL 查询 | DSL 查询 | 预期 DSL |
+|------|---------|---------|:---:|
+| G1 时间范围+聚合 | `SELECT service, level, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt FROM perf_test_10m WHERE \`@timestamp\` > '2026-07-11T00:00:00Z' GROUP BY service, level ORDER BY service, cnt DESC` | `{"size":0,"query":{"range":{"@timestamp":{"gte":"2026-07-11T00:00:00Z"}}},"aggs":{"by_service":{"terms":{"field":"service"},"aggs":{"by_level":{"terms":{"field":"level"},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}}}}}}}}` | 300-600ms |
+| G2 多字段排序+10K | `SELECT * FROM perf_test_10m WHERE level = 'ERROR' AND \`@timestamp\` > '2026-07-17T00:00:00Z' ORDER BY response_time_ms DESC, bytes DESC LIMIT 10000` | `{"query":{"bool":{"filter":[{"term":{"level":"ERROR"}},{"range":{"@timestamp":{"gte":"2026-07-17T00:00:00Z"}}]}},"sort":[{"response_time_ms":"desc"},{"bytes":"desc"}],"size":10000}` | 200-500ms |
+| G3 高基数聚合+过滤 | `SELECT user_id, COUNT(*) as req_count, AVG(response_time_ms) as avg_rt, MAX(bytes) as max_bytes, SUM(bytes) as total_bytes FROM perf_test_10m WHERE \`@timestamp\` > '2026-07-17T00:00:00Z' AND status_code = 200 GROUP BY user_id ORDER BY req_count DESC LIMIT 1000` | `{"size":0,"query":{"bool":{"filter":[{"range":{"@timestamp":{"gte":"2026-07-17T00:00:00Z"}}},{"term":{"status_code":200}}]}},"aggs":{"by_user":{"terms":{"field":"user_id","size":1000,"order":{"_count":"desc"}},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"max_bytes":{"max":{"field":"bytes"}},"total_bytes":{"sum":{"field":"bytes"}}}}}}` | 300-600ms |
+| G4 复合+5K | `SELECT service, level, response_time_ms, bytes, \`@timestamp\`, request_path, client_ip FROM perf_test_10m WHERE status_code >= 400 AND response_time_ms > 2000 AND \`@timestamp\` > '2026-07-15T00:00:00Z' ORDER BY response_time_ms DESC LIMIT 5000` | `{"query":{"bool":{"filter":[{"range":{"status_code":{"gte":400}}},{"range":{"response_time_ms":{"gt":2000}}},{"range":{"@timestamp":{"gte":"2026-07-15T00:00:00Z"}}]}},"sort":[{"response_time_ms":"desc"}],"size":5000,"_source":["service","level","response_time_ms","bytes","@timestamp","request_path","client_ip"]}` | 150-400ms |
 
 #### 场景组 H：极重查询
 
-| 场景 | SQL | DSL | 预期 DSL |
-|------|-----|-----|:---:|
-| H1 全表500K桶聚合 | 按 session_id 聚合 Top5000 | terms(size:5000) | 800-2000ms |
-| H2 全表多级聚合 | service×level×region + percentile | nested aggs+percentile | 600-1500ms |
-| H3 大范围+10K | 7 天数据排序取 10K | range+sort+size:10K | 400-800ms |
+| 场景 | SQL 查询 | DSL 查询 | 预期 DSL |
+|------|---------|---------|:---:|
+| H1 全表500K桶聚合 | `SELECT session_id, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt FROM perf_test_10m WHERE response_time_ms > 100 GROUP BY session_id ORDER BY cnt DESC LIMIT 5000` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":100}}},"aggs":{"by_session":{"terms":{"field":"session_id","size":5000,"order":{"_count":"desc"}},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}}}}}}` | 800-2000ms |
+| H2 全表多级聚合 | `SELECT service, level, region, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt, SUM(bytes) as total_bytes FROM perf_test_10m GROUP BY service, level, region ORDER BY service, cnt DESC` | `{"size":0,"aggs":{"by_service":{"terms":{"field":"service"},"aggs":{"by_level":{"terms":{"field":"level"},"aggs":{"by_region":{"terms":{"field":"region"},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"total_bytes":{"sum":{"field":"bytes"}},"p99":{"percentiles":{"field":"response_time_ms","percents":[99]}}}}}}}}}}` | 600-1500ms |
+| H3 大范围+10K | `SELECT * FROM perf_test_10m WHERE \`@timestamp\` > '2026-07-11T00:00:00Z' ORDER BY response_time_ms DESC LIMIT 10000` | `{"query":{"range":{"@timestamp":{"gte":"2026-07-11T00:00:00Z"}}},"sort":[{"response_time_ms":"desc"}],"size":10000}` | 400-800ms |
 
 #### 翻译开销分解方法
 
