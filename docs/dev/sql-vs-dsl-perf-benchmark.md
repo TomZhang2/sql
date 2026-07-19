@@ -1806,3 +1806,504 @@ CTE ─────────────────────────�
 | **P3** | 子查询 + 外层 GROUP BY | 5-8 | 依赖 P2 | 同上 |
 | **P4** | 标量子查询 | 8-12 | 表达式级 | 复杂度最高 |
 | **P5** | CTE | 10-15 | 语句级 | 可用派生表替代 |
+
+---
+
+## 第五部分：10M 多节点生产级验证方案
+
+> 前述测试在单节点 512MB heap + 1M 数据 + forcemerge 环境下进行，DSL 异常快（6-60ms），
+> 导致 SQL 开销占比即使重查询也偏高（100-260%）。
+> 本部分设计 10M 数据 + 多节点集群的验证方案，目标是验证：
+> **"在大数据量重查询场景下，SQL 接口与 DSL 接口性能差异不大，SQL 额外开销在固定范围内（<10%）。"**
+
+### 5.1 测试环境
+
+#### 5.1.1 集群拓扑
+
+```
+3 节点集群（模拟生产最小可用配置）:
+  node-1: cluster_manager + data (8C 16G)
+  node-2: data (8C 16G)
+  node-3: data (8C 16G)
+
+每节点 JVM Heap: 8GB
+每节点磁盘: SSD 200GB
+网络: 万兆局域网（模拟生产网络延迟 ~0.1-0.5ms）
+```
+
+#### 5.1.2 索引设计
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "@timestamp": { "type": "date" },
+      "level": { "type": "keyword" },
+      "service": { "type": "keyword" },
+      "host": { "type": "keyword" },
+      "message": { "type": "text" },
+      "status_code": { "type": "integer" },
+      "response_time_ms": { "type": "integer" },
+      "bytes": { "type": "long" },
+      "user_id": { "type": "keyword" },
+      "region": { "type": "keyword" },
+      "session_id": { "type": "keyword" },
+      "request_path": { "type": "keyword" },
+      "client_ip": { "type": "ip" }
+    }
+  },
+  "settings": {
+    "number_of_shards": 6,
+    "number_of_replicas": 1,
+    "index.refresh_interval": "30s",
+    "index.max_result_window": 20000
+  }
+}
+```
+
+| 配置项 | 值 | 理由 |
+|--------|-----|------|
+| `number_of_shards` | 6 | 每节点 2 shard，3 节点并行查询 |
+| `number_of_replicas` | 1 | 生产标准配置，高可用 |
+| `max_result_window` | 20000 | 深度分页需要 |
+| 字段数 | 13 | 模拟生产日志索引宽表 |
+
+#### 5.1.3 数据量
+
+| 指标 | 值 |
+|------|-----|
+| 文档总数 | 10,000,000 |
+| 每文档大小 | ~500 bytes (JSON) |
+| 总数据量 | ~5GB |
+| 每 shard 数据量 | ~830MB |
+| 高基数字段 | `user_id`(100K)、`session_id`(500K)、`client_ip`(100K) |
+| 低基数字段 | `level`(4)、`service`(5)、`host`(5)、`region`(5) |
+
+#### 5.1.4 数据生成
+
+```python
+# generate_10m.py
+import json, random, time
+
+levels = ["INFO","WARN","ERROR","DEBUG"]
+services = ["auth-service","payment-service","order-service","search-service","notification-service"]
+hosts = [f"host-{i:02d}" for i in range(1, 21)]  # 20 hosts
+regions = ["us-east-1","us-west-2","eu-west-1","ap-southeast-1","ap-northeast-1"]
+messages = [
+    "Request processed successfully","Connection timeout to database",
+    "User authentication failed","Cache miss for key","Rate limit exceeded",
+    "Background job completed","Configuration reloaded","Health check passed",
+    "SSL certificate renewal required","Disk usage above threshold",
+    "Memory pressure detected","Thread pool exhausted","Circuit breaker opened",
+    "Latency spike detected","Downstream service unavailable"
+]
+request_paths = ["/api/v1/auth","/api/v1/orders","/api/v2/search","/api/v1/payment","/api/v1/users",
+                 "/api/v1/health","/api/v1/metrics","/api/v2/reports","/api/v1/config","/api/v1/logout"]
+status_codes = [200,200,200,200,200,200,301,302,400,401,403,404,404,500,500,502,503]
+
+batch_size = 100000
+total = 10000000
+batches = total // batch_size
+
+for batch_num in range(batches):
+    lines = []
+    for i in range(batch_num * batch_size, (batch_num + 1) * batch_size):
+        ts = int(time.time()) - random.randint(0, 30*24*3600)  # 最近30天
+        doc = {
+            "@timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+            "level": random.choice(levels),
+            "service": random.choice(services),
+            "host": random.choice(hosts),
+            "message": random.choice(messages),
+            "status_code": random.choice(status_codes),
+            "response_time_ms": random.randint(1, 10000),
+            "bytes": random.randint(100, 500000),
+            "user_id": f"user-{random.randint(1, 100000)}",
+            "region": random.choice(regions),
+            "session_id": f"sess-{random.randint(1, 500000)}",
+            "request_path": random.choice(request_paths),
+            "client_ip": f"10.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+        }
+        lines.append(json.dumps({"index": {"_index": "perf_test_10m"}}))
+        lines.append(json.dumps(doc))
+    with open(f"batch_{batch_num:03d}.json", "w") as f:
+        f.write("\n".join(lines) + "\n")
+    if batch_num % 10 == 0:
+        print(f"Generated {batch_num * batch_size} / {total}")
+print(f"Done: {total} docs in {batches} batches")
+```
+
+#### 5.1.5 软件配置
+
+```
+OpenSearch: 3.7.0 (3 节点集群)
+SQL Plugin: 3.7.0.0-SNAPSHOT (含 UNION/UNION ALL 扩展)
+plugins.calcite.enabled: true
+plugins.calcite.pushdown.enabled: true
+plugins.query.size_limit: 100000
+plugins.query.memory_limit: 80%
+plugins.sql.slowlog: 0  # 记录所有查询的服务端执行时间
+
+# 索引级
+index.max_result_window: 20000
+index.requests.cache.enable: false  # 禁用 request cache 确保公平
+```
+
+#### 5.1.6 预期 DSL 延迟范围
+
+| 场景 | 单节点 1M (实测) | 多节点 10M (预期) | 变化因素 |
+|------|:---:|:---:|------|
+| 点查 10 行 | 0.8ms | 5-15ms | 数据量 10x + 网络 |
+| 大结果集 10K 行 | 59ms | 200-500ms | 数据量 10x + fetch 跨节点 |
+| 高基数聚合 | 18ms | 200-600ms | 100K 桶 + 跨 shard 聚合 |
+| 三级聚合 | 39ms | 300-800ms | 跨 shard 三级归并 |
+| 深度翻页 | 6ms | 300-600ms | 跨 shard 排序 20000 行 |
+| UNION+聚合 | 14ms | 50-150ms | 3 次跨 shard 聚合 |
+
+> **关键**：多节点 10M 下 DSL 执行时间预期 50-800ms，SQL 翻译开销固定在 5-80ms，
+> 开销占比预期降至 1-15%，可验证"差异不大"的结论。
+
+### 5.2 测试场景
+
+> 从 3.2b 重查询场景中选取有 DSL 对照的场景，确保每场景 DSL 预期 >100ms。
+> 额外增加生产典型场景（时间范围过滤 + 聚合、多字段排序）。
+
+#### 场景组 G：生产典型重查询
+
+**G1. 时间范围 + 聚合（日志分析最常见查询）**
+
+```sql
+-- SQL — 最近 7 天数据（~2.3M docs）按 service 聚合
+SELECT service, level, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt, PERCENTILE(response_time_ms, 95) as p95
+FROM perf_test_10m
+WHERE @timestamp > NOW() - INTERVAL 7 DAY
+GROUP BY service, level
+ORDER BY service, cnt DESC;
+```
+```json
+// DSL
+{"size":0,"query":{"range":{"@timestamp":{"gte":"now-7d"}}},"aggs":{"by_service":{"terms":{"field":"service"},"aggs":{"by_level":{"terms":{"field":"level"},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"p95":{"percentiles":{"field":"response_time_ms","percents":[95]}}}}}}}}
+```
+> 预期 DSL: 300-600ms（2.3M docs 扫描 + 聚合 + percentile）
+> 预期 SQL 开销: 5-15ms
+> 预期开销占比: 1-5%
+
+**G2. 多字段排序 + 大结果集**
+
+```sql
+-- SQL — ERROR 日志按多字段排序取 10000
+SELECT * FROM perf_test_10m
+WHERE level = 'ERROR' AND @timestamp > NOW() - INTERVAL 1 DAY
+ORDER BY response_time_ms DESC, bytes DESC
+LIMIT 10000;
+```
+```json
+// DSL
+{"query":{"bool":{"filter":[{"term":{"level":"ERROR"}},{"range":{"@timestamp":{"gte":"now-1d"}}}]}},"sort":[{"response_time_ms":"desc"},{"bytes":"desc"}],"size":10000}
+```
+> 预期 DSL: 200-500ms（~330K docs 排序 + fetch 10K）
+> 预期 SQL 开销: 5-15ms
+> 预期开销占比: 1-7%
+
+**G3. 高基数聚合 + 过滤（用户行为分析）**
+
+```sql
+-- SQL — 按 user_id 聚合 Top 1000 活跃用户
+SELECT user_id, COUNT(*) as req_count, AVG(response_time_ms) as avg_rt, MAX(bytes) as max_bytes, SUM(bytes) as total_bytes
+FROM perf_test_10m
+WHERE @timestamp > NOW() - INTERVAL 1 DAY AND status_code = 200
+GROUP BY user_id
+ORDER BY req_count DESC
+LIMIT 1000;
+```
+```json
+// DSL
+{"size":0,"query":{"bool":{"filter":[{"range":{"@timestamp":{"gte":"now-1d"}}},{"term":{"status_code":200}}]}},"aggs":{"by_user":{"terms":{"field":"user_id","size":1000,"order":{"_count":"desc"}},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"max_bytes":{"max":{"field":"bytes"}},"total_bytes":{"sum":{"field":"bytes"}}}}}}
+```
+> 预期 DSL: 300-600ms（330K docs + 100K 桶 + 4 指标）
+> 预期 SQL 开销: 5-15ms
+> 预期开销占比: 1-5%
+
+**G4. 复合查询 + 排序 + 中等结果集**
+
+```sql
+-- SQL — 多条件 + 排序 + 5000 行
+SELECT service, level, response_time_ms, bytes, @timestamp, request_path, client_ip
+FROM perf_test_10m
+WHERE status_code >= 400 AND response_time_ms > 2000 AND @timestamp > NOW() - INTERVAL 3 DAY
+ORDER BY response_time_ms DESC
+LIMIT 5000;
+```
+```json
+// DSL
+{"query":{"bool":{"filter":[{"range":{"status_code":{"gte":400}}},{"range":{"response_time_ms":{"gt":2000}}},{"range":{"@timestamp":{"gte":"now-3d"}}}]}},"sort":[{"response_time_ms":"desc"}],"size":5000,"_source":["service","level","response_time_ms","bytes","@timestamp","request_path","client_ip"]}
+```
+> 预期 DSL: 150-400ms（过滤 + 排序 + fetch 5K）
+> 预期 SQL 开销: 5-15ms
+> 预期开销占比: 2-7%
+
+#### 场景组 H：极重查询（验证开销占比收敛）
+
+**H1. 全表扫描 + 高基数聚合**
+
+```sql
+-- SQL — 全表 10M docs 按 session_id 聚合（500K 桶）
+SELECT session_id, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt
+FROM perf_test_10m
+WHERE response_time_ms > 100
+GROUP BY session_id
+ORDER BY cnt DESC
+LIMIT 5000;
+```
+```json
+// DSL
+{"size":0,"query":{"range":{"response_time_ms":{"gt":100}}},"aggs":{"by_session":{"terms":{"field":"session_id","size":5000,"order":{"_count":"desc"}},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}}}}}}
+```
+> 预期 DSL: 800-2000ms（10M docs + 500K 桶聚合）
+> 预期 SQL 开销: 10-30ms
+> 预期开销占比: 0.5-3% ✅ 核心验证场景
+
+**H2. 全表多级聚合 + percentile**
+
+```sql
+-- SQL — 全表 按 service×level×region 聚合（500 桶）+ percentile
+SELECT service, level, region, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt, SUM(bytes) as total_bytes, PERCENTILE(response_time_ms, 99) as p99
+FROM perf_test_10m
+GROUP BY service, level, region
+ORDER BY service, cnt DESC;
+```
+```json
+// DSL
+{"size":0,"aggs":{"by_service":{"terms":{"field":"service"},"aggs":{"by_level":{"terms":{"field":"level"},"aggs":{"by_region":{"terms":{"field":"region"},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"total_bytes":{"sum":{"field":"bytes"}},"p99":{"percentiles":{"field":"response_time_ms","percents":[99]}}}}}}}}}}
+```
+> 预期 DSL: 600-1500ms（10M docs + 三级聚合 + percentile）
+> 预期 SQL 开销: 5-15ms（composite 聚合下推，可能比 DSL 更快）
+> 预期开销占比: 0.3-2% ✅ 核心验证场景
+
+**H3. 大范围扫描 + 排序 + 大结果集**
+
+```sql
+-- SQL — 7 天数据（~2.3M docs）排序取 10000
+SELECT * FROM perf_test_10m
+WHERE @timestamp > NOW() - INTERVAL 7 DAY
+ORDER BY response_time_ms DESC
+LIMIT 10000;
+```
+```json
+// DSL
+{"query":{"range":{"@timestamp":{"gte":"now-7d"}}},"sort":[{"response_time_ms":"desc"}],"size":10000}
+```
+> 预期 DSL: 400-800ms（2.3M docs 排序 + fetch 10K 跨节点）
+> 预期 SQL 开销: 5-15ms
+> 预期开销占比: 0.6-3% ✅ 核心验证场景
+
+#### 场景组 I：SQL 独有（大数据量验证）
+
+**I1. 三路 UNION ALL + 聚合（pushdown ON）**
+
+```sql
+SELECT service, COUNT(*) as cnt FROM perf_test_10m WHERE level = 'ERROR' GROUP BY service
+UNION ALL
+SELECT service, COUNT(*) as cnt FROM perf_test_10m WHERE level = 'WARN' GROUP BY service
+UNION ALL
+SELECT service, COUNT(*) as cnt FROM perf_test_10m WHERE level = 'DEBUG' GROUP BY service;
+```
+> 预期 SQL: 50-200ms（3 次跨 shard 下推聚合 + 合并 15 行）
+
+**I2. 大表 JOIN**
+
+```sql
+SELECT a.service, a.level, a.response_time_ms, b.dept_name
+FROM perf_test_10m a
+JOIN perf_test_meta b ON a.host = b.host
+WHERE a.level = 'ERROR' AND a.@timestamp > NOW() - INTERVAL 1 DAY
+LIMIT 10000;
+```
+> 预期 SQL: 300-800ms（~330K 行 Hash Join）
+
+**I3. IN 子查询**
+
+```sql
+SELECT service, level, response_time_ms FROM perf_test_10m
+WHERE host IN (SELECT host FROM perf_test_meta)
+AND @timestamp > NOW() - INTERVAL 1 DAY
+LIMIT 10000;
+```
+> 预期 SQL: 300-800ms（大表 IN 子查询）
+
+### 5.3 预期结果矩阵
+
+| 场景 | 预期 DSL (ms) | 预期 SQL (ms) | 预期翻译开销 (ms) | 预期开销占比 | 验证目标 |
+|------|:---:|:---:|:---:|:---:|------|
+| G1 时间范围+聚合 | 300-600 | 310-620 | 5-15 | 1-5% | 生产典型场景开销可忽略 |
+| G2 多字段排序+10K | 200-500 | 210-520 | 5-15 | 1-7% | 大结果集开销可忽略 |
+| G3 高基数聚合 | 300-600 | 310-620 | 5-15 | 1-5% | 100K 桶开销可忽略 |
+| G4 复合+5K | 150-400 | 160-420 | 5-15 | 2-7% | 中等重查询 |
+| **H1 全表高基数聚合** | **800-2000** | **820-2030** | **10-30** | **0.5-3%** | **核心：极重查询验证** |
+| **H2 全表多级聚合** | **600-1500** | **610-1520** | **5-15** | **0.3-2%** | **核心：极重查询验证** |
+| **H3 大范围+10K** | **400-800** | **410-820** | **5-15** | **0.6-3%** | **核心：极重查询验证** |
+| I1 三路UNION | — | 50-200 | — | — | SQL 独有 |
+| I2 大表JOIN | — | 300-800 | — | — | SQL 独有 |
+| I3 IN子查询 | — | 300-800 | — | — | SQL 独有 |
+
+### 5.4 验证方法论
+
+#### 5.4.1 翻译开销分解（核心方法）
+
+> 通过 OpenSearch slowlog 获取实际服务端执行时间，精确分解 SQL 翻译开销。
+
+**步骤**：
+
+1. **开启 slowlog**：`index.search.slowlog.threshold.query.info: 0ms`（记录所有查询）
+2. **运行 SQL 查询**：记录端到端延迟 `T_sql`
+3. **从 slowlog 提取**：服务端执行时间 `T_exec`（搜索引擎实际耗时）
+4. **计算翻译开销**：`T_translate = T_sql - T_exec`
+5. **运行等价 DSL**：记录端到端延迟 `T_dsl`
+6. **验证**：`T_exec ≈ T_dsl`（SQL 生成的 DSL 执行时间应接近直接 DSL）
+7. **开销占比**：`T_translate / T_dsl × 100%`
+
+**关键指标**：
+
+| 指标 | 含义 | 预期 |
+|------|------|------|
+| `T_translate` | SQL 翻译开销（解析+分析+规划+DSL生成） | 5-30ms，与查询复杂度弱相关 |
+| `T_translate / T_dsl` | 翻译开销占 DSL 执行时间的比例 | <10%（重查询） |
+| `T_translate` 标准差 | 翻译开销的稳定性 | <2ms（JIT 充分预热后） |
+
+#### 5.4.2 预热与测试轮次
+
+```
+预热: 30 轮（充分触发 JIT C2 + Calcite Janino codegen + OS page cache + filter cache）
+测试: 100 轮（多节点环境下每轮更慢，100 轮足够统计）
+两遍运行: 第一遍丢弃（验证 JIT 稳定性）
+```
+
+#### 5.4.3 缓存控制
+
+| 缓存 | 处理方式 | 理由 |
+|------|---------|------|
+| request cache | `?request_cache=false` | 聚合场景必须禁用 |
+| filter cache | 不禁用 | 生产环境会命中，保留此优势 |
+| query cache | 不禁用 | 同上 |
+| OS page cache | 预热后保留 | 生产环境会命中 |
+
+#### 5.4.4 结果验证
+
+每个场景需验证：
+
+1. **结果集等价**：SQL 和 DSL 返回相同数据（行数+值，忽略顺序）
+2. **执行路径确认**：通过 `_explain` 确认 SQL 走 V2/Calcite/Legacy 哪条路径
+3. **下推确认**（Calcite 路径）：explain 中是否有 `PushDownContext`
+4. **回退监控**：检查服务端日志 "Fallback to V2" 消息
+5. **slowlog 一致性**：SQL 生成的 DSL 与手写 DSL 的服务端执行时间是否接近
+
+### 5.5 预期结论框架
+
+```
+目标结论: 大数据量重查询场景下，SQL 与 DSL 性能差异不大。
+
+验证条件:
+  H1/H2/H3 场景（DSL >800ms）: SQL 开销占比 <5%  → "差异不大" ✅
+  G1-G4 场景（DSL 150-600ms）: SQL 开销占比 <10% → "差异可接受" ✅
+  T_translate 稳定在 5-30ms    → "固定范围内" ✅
+  T_exec ≈ T_dsl               → "SQL 生成的 DSL 执行效率与手写 DSL 一致" ✅
+
+如验证通过，结论:
+  "在 10M 数据量多节点集群的重查询场景下（DSL 执行时间 >200ms），
+   SQL 接口的额外翻译开销稳定在 5-30ms 范围内，
+   占 DSL 执行时间的 1-10%，性能差异在可接受范围内。
+   SQL 生成的 DSL 执行效率与手写 DSL 基本一致。"
+
+如验证不通过（开销占比 >10%）:
+  分析根因 — 可能是 JdbcResponseFormatter 序列化开销（大结果集）
+  或 V2 聚合路径翻译开销（高基数聚合）导致。
+```
+
+### 5.6 与单节点 1M 测试的对比维度
+
+| 维度 | 单节点 1M（已完成） | 多节点 10M（本方案） | 预期变化 |
+|------|-----|-----|------|
+| DSL 绝对延迟 | 6-60ms | 150-2000ms | 10-30x 增大 |
+| SQL 翻译开销 | 0.5-80ms | 5-30ms | 范围收窄（JIT 充分预热） |
+| SQL 开销占比 | 18-807% | 0.3-10% | 大幅下降 |
+| 网络 | 本地回环 | 万兆局域网 | DSL 有 scatter-gather 开销 |
+| 数据量 | 1M | 10M | DSL 执行时间线性增长 |
+| 聚合桶数 | 4-100 | 500-500K | DSL 聚合计算显著变重 |
+| 结果集 | 10-10K 行 | 5K-10K 行 | 相似（受 max_result_window 限制） |
+| forcemerge | 是 | 否 | DSL 需多 segment 合并 |
+| 可推广性 | 仅单节点 | 接近生产 | ✅ 可推广到生产环境 |
+
+### 5.7 执行步骤
+
+```bash
+#!/bin/bash
+# run_10m_benchmark.sh
+
+ES="http://node-1:9200"
+
+echo "=== 1. Create Index ==="
+curl -s -X PUT "$ES/perf_test_10m" -H 'Content-Type: application/json' -d '@index_10m_mapping.json'
+
+echo "=== 2. Load 10M Docs ==="
+# 分批导入，每批 100K
+for i in $(seq -w 000 099); do
+  curl -s -X POST "$ES/_bulk?refresh=false" -H 'Content-Type: application/x-ndjson' --data-binary @batch_$i.json > /dev/null
+  echo "Loaded batch $i: $(curl -s "$ES/_cat/indices/perf_test_10m?h=docs.count" | tr -d ' ') docs"
+done
+
+echo "=== 3. Wait for Indexing ==="
+while [ "$(curl -s "$ES/_cat/indices/perf_test_10m?h=docs.count" | tr -d ' ')" -lt "10000000" ]; do
+  echo "  $(curl -s "$ES/_cat/indices/perf_test_10m?h=docs.count" | tr -d ' ')/10000000"
+  sleep 10
+done
+
+echo "=== 4. DO NOT forcemerge (模拟生产) ==="
+echo "Skipping forcemerge to simulate production segment distribution"
+
+echo "=== 5. Enable Slowlog ==="
+curl -s -X PUT "$ES/perf_test_10m/_settings" -H 'Content-Type: application/json' -d '{
+  "index.search.slowlog.threshold.query.info": "0ms",
+  "index.search.slowlog.threshold.fetch.info": "0ms"
+}'
+
+echo "=== 6. Enable Calcite ==="
+curl -s -X PUT "$ES/_cluster/settings" -H 'Content-Type: application/json' -d '{
+  "persistent": {"plugins.calcite.enabled": "true", "plugins.calcite.pushdown.enabled": "true"}
+}'
+
+echo "=== 7. Result Equivalence Audit ==="
+python3 verify_results.py
+
+echo "=== 8. Run Benchmarks (pass 1 - discard) ==="
+python3 benchmark_10m.py --tag pass1
+
+echo "=== 9. Run Benchmarks (pass 2 - keep) ==="
+python3 benchmark_10m.py --tag pass2
+
+echo "=== 10. Analyze ==="
+python3 analyze_results.py
+```
+
+### 5.8 分析报告模板
+
+```markdown
+## 10M 多节点验证结果
+
+### 翻译开销分解
+
+| 场景 | T_sql (ms) | T_exec (ms, slowlog) | T_translate (ms) | T_dsl (ms) | T_translate/T_dsl |
+|------|:---:|:---:|:---:|:---:|:---:|
+| H1 | ___ | ___ | ___ | ___ | ___% |
+| H2 | ___ | ___ | ___ | ___ | ___% |
+| H3 | ___ | ___ | ___ | ___ | ___% |
+
+### 结论验证
+
+- [ ] H1/H2/H3 开销占比 <5% → "差异不大" ✅/❌
+- [ ] G1-G4 开销占比 <10% → "差异可接受" ✅/❌
+- [ ] T_translate 稳定在 5-30ms → "固定范围" ✅/❌
+- [ ] T_exec ≈ T_dsl → "执行效率一致" ✅/❌
+
+### 最终结论
+___
+```
