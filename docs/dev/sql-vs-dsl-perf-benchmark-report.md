@@ -226,11 +226,15 @@
 
 > 经 Oracle 大数据专家深度审视和手动验证，以下数据需修正或标注限制：
 
-**1. SQL 聚合场景的 filter cache 污染（影响 C1-C3）**
+**1. SQL 聚合场景的 filter cache 污染（影响 C1-C3）— 已重测确认**
 
 SQL 路径经 `_plugins/_sql` 走 PIT 机制，OpenSearch 的 **filter cache 对 SQL 请求仍生效**。基准测试中 C1-C3 虽然使用了随机阈值打散 request cache，但 filter cache（缓存 `bool.filter` 条件结果）仍可能命中。
 
-手动验证证实：SQL 重复相同聚合查询，首次 249ms → 后续 34-37ms（filter cache 命中）。因此 C1-C3 的 SQL 数据（12.7-27.4ms）可能部分受益于 filter cache，实际冷查询 SQL 延迟可能更高。
+**重测确认**（随机阈值 + 无 percentile，1M 数据）：
+- C1 重测：SQL 3.6ms vs DSL 1.6ms（原数据 SQL 12.7ms vs DSL 1.4ms）
+- C2-H 重测：SQL 3.0ms vs DSL 1.4ms（原数据 SQL 2.1ms vs DSL 39.4ms）
+
+C1 原 12.7ms 偏高可能是预热不足 + JIT 未充分编译。重测 3.6ms 更合理。C2-H 原 2.1ms 是 cache hit 假数据，重测 3.0ms 是真实性能。
 
 **2. SQL 翻译开销范围**
 

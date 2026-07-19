@@ -31,23 +31,23 @@
 
 | 场景 | SQL avg (ms) | SQL p50 | DSL avg (ms) | DSL p50 | 差异 (ms) | 差异 (%) | SQL 引擎 |
 |------|:---:|:---:|:---:|:---:|:---:|:---:|------|
-| **G1 时间范围+聚合** | **2.7** | 2.6 | 30.7 | 27.8 | **-28.0** | **-91%** | V2 |
+| **G1 时间范围+聚合** | **121.7**³ | 115.1 | 50.7³ | 49.8 | +71.0 | +140% | V2 |
 | G3 高基数聚合+过滤 | 859.2 | 858.8 | 26.0 | 24.9 | +833.2 | +3205% | V2 |
-| **H1 全表500K桶聚合** | **2354**¹ | 2116¹ | 329² | 30² | +2025 | **+615%** | V2 |
-| **H2 全表多级聚合** | **4.6** | 4.4 | 379.0 | 379.1 | **-374.4** | **-99%** | V2 |
+| **H1 全表500K桶聚合** | **32991**⁴ | 33129 | 143.7⁴ | 118.5 | +32847 | **+22865%** | V2 |
+| **H2 全表多级聚合** | **211.4**³ | 209.3 | 104.9³ | 103.3 | +106.5 | +102% | V2 |
 | H3 大范围+排序+10K | 173.4 | 171.3 | 71.8 | 71.2 | +101.6 | +142% | V2 |
 | E1 三路UNION+聚合 | 12.5 | 12.0 | — | — | — | — | Calcite |
 | E2 大表JOIN 10K | 744.1 | 715.4 | — | — | — | — | Legacy V1 |
 | E3 IN子查询 10K | 789.5 | 729.3 | — | — | — | — | Legacy V1 |
 
-> ¹ H1 数据修正：原基准测试因 512MB heap 导致 GC 频繁，测得 54521ms。单次手动验证（5 次）稳定在 1941-3015ms，avg 2354ms。
-> ² H1 DSL 首次执行 329-354ms，后续执行因 filter cache 命中降至 29-31ms。取首次值更公平。
+> ³ G1/H2 数据修正（重测）：原数据（G1 SQL=2.7ms, H2 SQL=4.6ms）因 SQL 路径不尊守 `request_cache=false`，filter cache 命中导致假数据。重测使用随机阈值打散缓存 + DSL 去掉 percentile 保持查询等价。重测结果：G1 SQL=121.7ms, H2 SQL=211.4ms，SQL 实际比 DSL 慢 1.4-2.0x。
+> ⁴ H1 重测：512MB heap 下 composite 翻页 500 次导致严重 GC，avg 32991ms（部分查询触发 circuit breaker）。H1 DSL 部分查询也触发 circuit breaker，有效样本仅 3 次。H1 数据可信度低，需更大 heap 重测。
 
 ### 按性能差异分类
 
 | 分类 | 场景 | SQL vs DSL | 原因 |
 |------|------|:---:|------|
-| **SQL 更快** | G1, H2 | SQL 快 82-91% | V2 composite 聚合下推比 DSL nested aggs 高效 |
+| **SQL 慢 1.4-2.0x** | G1, H2 | SQL 慢 102-140% | V2 composite 翻译开销 + DSL 查询等价后更快 |
 | **SQL 明显慢** | H3 | SQL 慢 2.4x | JdbcResponseFormatter 序列化 10K 行开销 ~100ms |
 | **SQL 极慢** | G3, H1 | SQL 慢 33-100x | V2 composite 聚合翻页拉取 vs DSL terms Top-N |
 | **SQL 独有** | E1, E2, E3 | 无对照 | UNION/JOIN/IN 子查询 |
@@ -83,36 +83,27 @@ V2 确实下推了 composite 聚合到 OpenSearch，但 `size=1000` 意味着 50
 
 **结论**：**高基数聚合（GROUP BY 高基数字段）的性能差异来自聚合策略选择**——V2 用 `composite`（分页拉取，适合全量遍历），DSL 用 `terms`（Top-N，适合排序取前 N）。当 `LIMIT 5000` 时 DSL 的 `terms(size=5000)` 更高效。这是 V2 的优化空间，而非 SQL 接口的固有缺陷。
 
-### 3.2 ⚠️ G1/H2：数据可信度存疑（filter cache 污染 + 查询不等价）
+### 3.2 G1/H2：重测确认 SQL 比 DSL 慢 1.4-2.0x（原结论已推翻）
 
-**原结论**：SQL 快 91-99%，composite 聚合是结构性优势。
+**原结论（已推翻）**：SQL 快 82-99%，composite 聚合是结构性优势。
 
-**修正**：经手动验证，此结论**不可靠**，两个问题：
+**重测结论**：SQL 比 DSL 慢 1.4-2.0x。原数据受 filter cache 污染 + DSL 查询含 percentile 导致不公平。
 
-**问题 1：filter cache 污染**
+**重测方法**：
+- 使用随机阈值（1-9000）打散 filter cache
+- DSL 去掉 percentile 聚合，保持与 SQL 查询等价（均计算 COUNT + AVG）
 
-SQL 路径经 `_plugins/_sql` 走 PIT 机制，OpenSearch 的 **filter cache 对 SQL 请求生效**（不像 DSL 可以通过 `?request_cache=false` 禁用）。
+**重测数据**：
 
-手动验证（10M 数据）：
-```
-SQL 重复相同聚合查询: 首次 249ms → 后续 34-37ms (filter cache 命中)
-DSL 重复相同查询(request_cache=false): 始终 122ms (每次真实计算)
-```
+| 场景 | SQL avg (ms) | DSL avg (ms) | 差异 | 原数据（错误） |
+|------|:---:|:---:|:---:|:---:|
+| G1（10M, 随机阈值） | 121.7 | 50.7 | SQL 慢 140% | 原 SQL=2.7ms (cache hit) |
+| H2（10M, 随机阈值, 无 percentile） | 211.4 | 104.9 | SQL 慢 102% | 原 SQL=4.6ms (cache hit), DSL=379ms (with percentile) |
 
-基准测试中 G1 SQL=2.7ms、H2 SQL=4.6ms 是重复相同查询后的缓存命中结果，**不代表真实计算性能**。
-
-**问题 2：查询不等价**
-
-DSL 的 H2 查询包含 `percentile`（tdigest，计算开销大），SQL 的 composite 聚合仅计算 COUNT + AVG（通过 `_explain` 确认）。手动验证：去掉 DSL 的 percentile 后，DSL 从 379ms 降至 ~194ms。
-
-**修正后结论**：G1/H2 的 "SQL 快 82-99%" 结论**不成立**。需要重新测试：
-- SQL 使用随机阈值打散 filter cache
-- DSL 去掉 percentile 保持查询等价
-
-初步手动验证（随机阈值 + 无 percentile）：
-- SQL G1: ~251ms（冷查询）
-- DSL G1: ~122ms（冷查询）
-- **SQL 实际比 DSL 慢 ~2 倍**（翻译开销 + V2 composite 翻页开销）
+**根因分析**：
+- SQL 额外开销（翻译+composite 翻页）约 70-107ms
+- DSL 直接构造 `terms` 聚合请求，无翻译开销
+- **不存在 "SQL composite 比 DSL nested aggs 高效" 的结构性优势**——原结论是 filter cache 污染 + 查询不等价的假象
 
 ### 3.3 🟡 H3：大结果集额外开销（估算，未实测分解）
 
@@ -203,9 +194,9 @@ DSL 的 H2 查询包含 `percentile`（tdigest，计算开销大），SQL 的 co
 
 | 场景类型 | 能否说"差异不大"？ | 数据支撑 |
 |---------|:---:|------|
-| 低基数多级聚合 | ⚠️ 待重测 | G1/H2 原 "SQL 快 82-99%" 受 filter cache 污染+查询不等价，手动验证后 SQL 实际慢 ~2x |
-| 高基数聚合 | ❌ DSL 更快 | H1/G3：DSL 快 7-33x（composite 翻页导致） |
-| 大结果集+排序 | ⚠️ 总额外开销 142%，翻译/格式化比例未验证 | H3：总额外 101ms，翻译/格式化未实测分解 |
+| 低基数多级聚合 | ⚠️ SQL 慢 1.4-2.0x | G1/H2 重测：SQL 慢 102-140%（原 "SQL 快 82-99%" 已推翻） |
+| 高基数聚合 | ❌ DSL 更快 | H1/G3：DSL 快 33-228x（composite 翻页 + 512MB heap GC） |
+| 大结果集+排序 | ⚠️ 总额外开销 142% | H3：总额外 101ms，翻译/格式化比例未验证 |
 | UNION+聚合 | ✅ 无对照，SQL 12.5ms | E1：pushdown 高效 |
 | JOIN/IN子查询 | ✅ 无对照，SQL 744-790ms | E2/E3：合理 |
 
