@@ -578,6 +578,8 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 
 **关键前提**：OpenSearch 官方 nightly 基准（[opensearch.org/benchmarks](https://opensearch.org/benchmarks/)）主要在**单节点** `c5.2xlarge` (8 vCPU, 16 GB RAM, 8 GB JVM heap) 上运行，索引为 **1 primary shard / 0 replica**，数据集 ~100 GB / 116M 文档（Big5 workload）。这与本测试 10M/3 节点规模不同，但官方数据可作为**单节点基准线**，再结合多节点扩展性研究外推。
 
+> ⚠️ **路径说明（重要）**：本章引用的官方/第三方基准**均为 DSL 路径**（直接发 `_search` 端点，由 OpenSearch Benchmark / rally 驱动，**不经过 SQL 插件**）。因此本章数据**仅用于交叉验证本测试 4.7 节"预期 DSL"列的合理性**，不能直接推论 SQL 路径开销。SQL 插件 overhead 的官方数据见 6.7 节（PPL，≠ SQL）。
+
 ### 6.2 官方延迟数据交叉验证
 
 #### OpenSearch 3.0 Big5 性能（单节点，1 shard/0 replica）
@@ -596,7 +598,7 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 - 最慢单查询：`range-auto-date-histo-with-metrics` 在 OS 3.0 为 **5406 ms**（1.3 为 22988 ms）
 - 高基数聚合 `cardinality-agg-high`：OS 3.0 = **628 ms**
 
-**交叉验证结论**：本测试 10M/3 节点 300–2000ms 的预期落在官方单节点同一 workload 的延迟区间内。单节点 terms agg 80ms，多节点 + 多 shard scatter-gather 会增加开销，300–600ms（G 组）合理；500K 桶高基数聚合 800–2000ms（H1）与官方 `cardinality-agg-high` 628ms + 多 shard 开销一致。
+**交叉验证结论**：本测试 10M/3 节点"预期 DSL"300–2000ms 落在官方单节点同一 workload 的延迟区间内。单节点 terms agg 80ms，多节点 + 多 shard scatter-gather 会增加开销，300–600ms（G 组）合理；500K 桶高基数聚合 800–2000ms（H1）与官方 `cardinality-agg-high` 628ms + 多 shard 开销一致。
 
 > ⚠️ **版本依赖性强**：若用 OS 2.x，date_histogram 类查询延迟可能比 3.x 高 2–70 倍。本测试基于 OS 3.7.0，结论不可外推到 2.x。
 
@@ -624,7 +626,7 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 | 3.5 | r7i | 1303.76 | 63.99 | 95 | 105 |
 | 3.5 | r7g | 1477.88 | 56.42 | 82 | 91 |
 
-**交叉验证结论**：官方 3 节点 10M 文档向量搜索 p99 91–330ms，比本测试 SQL/DSL 300–2000ms 低一个数量级——证明 SQL 解析 + Calcite 优化 + JDBC 序列化的 overhead 在数十到数百毫秒级别。
+**交叉验证结论**：官方 3 节点 10M 文档向量搜索 p99 91–330ms。注意：向量搜索走 HNSW/IVF 索引，与聚合查询（fielddata/doc_values）workload 完全不同，**不能用于推论 SQL overhead**。此处仅作为 3 节点 10M 规模的 DSL 路径延迟量级参考——向量搜索本身不经过 SQL 插件。
 
 ### 6.3 大规模部署参考（AWS 实例基准）
 
@@ -638,7 +640,7 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 | **hourly_aggregation p99** | **5308 ms** | **2985 ms** | OR1 快 44% |
 | **multi_term_aggregation p99** | **8506 ms** | **4264 ms** | OR1 快 50% |
 
-**外推参考**：3 节点 247M 文档 multi_term_agg p99 = 4.2–8.5 秒，比本测试 10M/3 节点 2 秒预期高 2–4 倍。文档数 10M → 247M (25x)，延迟 2s → 8.5s (4x)，**亚线性扩展**（因并行度未变）。
+**外推参考**：3 节点 247M 文档 multi_term_agg p99 = 4.2–8.5 秒，比本测试 10M/3 节点"预期 DSL"2 秒高 2–4 倍。文档数 10M → 247M (25x)，延迟 2s → 8.5s (4x)，**亚线性扩展**（因并行度未变）。
 
 #### AWS OM2 vs M7g（2 节点 247M 文档）
 
@@ -647,7 +649,7 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 - Multi-term Aggregation p99：M7g = 2468 ms，OM2 = 2200 ms
 - Hourly Aggregation p99：M7g = 72.77 ms，OM2 = 49.46 ms
 
-**外推参考**：2 节点 247M 文档 multi_term_agg p99 = 2.2–2.5 秒，与本测试 10M/3 节点 300–2000ms 区间一致。
+**外推参考**：2 节点 247M 文档 multi_term_agg p99 = 2.2–2.5 秒，与本测试 10M/3 节点"预期 DSL"300–2000ms 区间一致。
 
 ### 6.4 Scatter-Gather 与协调节点开销
 
@@ -718,7 +720,9 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 - **8 clients 时无收益**：CPU 饱和，intra-segment 失去意义
 - 本测试 1M forcemerge 与 10M 未 forcemerge 的 segment 数差异巨大（1 段 vs 50-200 段），**结构性不可比**
 
-### 6.7 SQL/PPL 插件大规模性能 Gap
+### 6.7 PPL 插件大规模性能 Gap（注意：PPL ≠ SQL）
+
+> ⚠️ **路径说明**：本节数据均为 **PPL 路径**（Piped Processing Language），不是 SQL。PPL 和 SQL 虽然在 OS 3.3+ 都走 Calcite，但查询语言不同（管道语法 vs SELECT 语法）、路由逻辑不同（PPL 默认走 Calcite，SQL 仅 UNION 走 Calcite）。PPL 数据**不能直接等同于 SQL 数据**，仅作为 Calcite 引擎路径的参考。
 
 来源：[PPL Calcite Optimizer](https://opensearch.org/blog/better-observability-deeper-insights-opensearchs-new-piped-processing-language-capabilities/)（2025-11-25）+ [SQL Issue #3528](https://github.com/opensearch-project/sql/issues/3528)
 
@@ -726,25 +730,27 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 - **大规模性能 gap**：750B 文档规模下，PPL span query **数百秒** vs DSL **秒级**（[Issue #3528](https://github.com/opensearch-project/sql/issues/3528)）
 - 根因：PPL 将 `span` 转为 composite aggregation，比 date_histogram 慢
 
-**外推警示**：小规模测试的 SQL/DSL 延迟比**不能直接外推**到生产规模。10M/3 节点测试可能看不出此问题，但 1B+ 文档规模下 PPL span 类查询可能比 DSL 慢 100x+。
+**外推警示**：小规模测试的 SQL/DSL 延迟比**不能直接外推**到生产规模。PPL 在 1B+ 文档规模下 span 类查询可能比 DSL 慢 100x+，SQL 路径因仅 UNION 走 Calcite，大规模表现需独立验证。
 
 ### 6.8 外推结论矩阵
 
-| 本测试规模 | 官方/第三方参考 | 外推结论 |
-|---------|---------|---------|
-| 1M / 单节点 | OS 3.0 单节点 Big5 geo mean 16ms；Trail of Bits OS 2.17 单节点 terms agg 105ms | 单节点基线合理 |
-| 10M / 3 节点, 300–2000ms | OS 3.5 vector 3 节点 10M p99 91–330ms；AWS OR1 3 节点 247M multi_term p99 4.2s | 预期落在合理区间 |
-| **30+ 节点外推** | ES Issue #112306: 50K shard 时 shard 解析成瓶颈；Star graph 模型 | **不能线性外推**；协调节点聚合开销 log 增长 |
-| **1B+ 文档外推** | Elastic 推荐 200M docs/shard → 1B 需 5+ shard；AWS 247M multi_term p99 4.2s | 1B 文档预计 multi_term agg p99 10–30s |
-| **SQL 插件 overhead** | OS 3.3 PPL Calcite 160x faster；750B 文档 PPL span 慢 100x | **版本依赖性强**；小规模测试不能外推到大规模 |
-| **Circuit breaker** | fielddata 40% heap 默认；parent 95% heap | 8 GB heap 节点高基数聚合易触发，生产建议 32+ GB |
-| **Forcemerge 收益** | Intra-segment RFC：单 segment 重聚合提升 76%（单 client），8 clients 无收益 | 只读索引可 forcemerge；写入活跃索引无收益 |
+> 路径列说明：DSL = 直接 `_search` 端点（不经过 SQL 插件）；PPL = Piped Processing Language（≠ SQL）；SQL = SQL 插件路径。本测试 4.7 节"预期 DSL"列仅可与 DSL 基准交叉验证。
+
+| 本测试规模 | 官方/第三方参考 | 参考路径 | 外推结论 |
+|---------|---------|:---:|---------|
+| 1M / 单节点 | OS 3.0 单节点 Big5 geo mean 16ms；Trail of Bits OS 2.17 单节点 terms agg 105ms | DSL | 单节点 DSL 基线合理 |
+| 10M / 3 节点, 预期 DSL 300–2000ms | OS 3.5 vector 3 节点 10M p99 91–330ms；AWS OR1 3 节点 247M multi_term p99 4.2s | DSL | "预期 DSL"落在合理区间 |
+| **30+ 节点外推** | ES Issue #112306: 50K shard 时 shard 解析成瓶颈；Star graph 模型 | DSL | **不能线性外推**；协调节点聚合开销 log 增长 |
+| **1B+ 文档外推** | Elastic 推荐 200M docs/shard → 1B 需 5+ shard；AWS 247M multi_term p99 4.2s | DSL | 1B 文档预计 DSL multi_term agg p99 10–30s |
+| **SQL 插件 overhead** | OS 3.3 PPL Calcite 160x faster；750B 文档 PPL span 慢 100x | PPL | **版本依赖性强**；PPL≠SQL，SQL 大规模表现需独立验证 |
+| **Circuit breaker** | fielddata 40% heap 默认；parent 95% heap | 不区分 | 8 GB heap 节点高基数聚合易触发，生产建议 32+ GB |
+| **Forcemerge 收益** | Intra-segment RFC：单 segment 重聚合提升 76%（单 client），8 clients 无收益 | DSL | 只读索引可 forcemerge；写入活跃索引无收益 |
 
 ### 6.9 最重要外推 Gap（必须在文档明确标注）
 
 1. **OpenSearch 官方 nightly 基准仅单节点 1 shard**，无 30+ 节点数据，需引用 Trail of Bits + AWS 实例基准做交叉验证
 2. **OpenSearch fork 自 ES 7.10**，ES 8.x 的 many-shards 优化（cluster state delta、snapshot pool doubling）未完全移植，ES 数据仅作参考
-3. **SQL/PPL 插件版本依赖性极强**：OS 3.3 Calcite 优化器带来数量级提升，2.x 测试结果不能外推到 3.x+
+3. **PPL 插件版本依赖性极强**（PPL ≠ SQL）：OS 3.3 Calcite 优化器带来数量级提升，2.x 测试结果不能外推到 3.x+。SQL 路径大规模表现无官方数据，需独立验证
 4. **大规模高基数聚合是 SQL 引擎已知弱项**（[Issue #3528](https://github.com/opensearch-project/sql/issues/3528)），小规模测试无法暴露此问题
 5. **协调节点 scatter-gather 在 1000+ shard 时成为瓶颈**（[ES Issue #112306](https://github.com/elastic/elasticsearch/issues/112306)），30 节点 × 100 shard = 3000 shard 已进入风险区
 
