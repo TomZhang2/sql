@@ -3,6 +3,8 @@
 > 基于 OpenSearch 3.7.0 + SQL Plugin 3.7.0（含 UNION/UNION ALL 扩展）
 > 所有 SQL 能力声明均已通过实测验证
 
+> ⚠️ **范围声明**：本文档仅评估 SQL 插件的**性能维度**。选型决策还需独立评估安全性（SQL 注入、权限控制）、运维（升级兼容性、监控完备性）、生态兼容（JDBC/ODBC 驱动、BI 工具对接）等维度。
+
 ---
 
 ## 目录
@@ -184,8 +186,9 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | JOIN + GROUP BY | ❌ | ❌ | SQL 报错 "JOIN queries do not support aggregations on the joined result."（`Util.java:44`） |
 | UNION ALL | ✅ | ❌ | SQL（我们的扩展，走 Calcite） |
 | UNION DISTINCT | ✅ | ❌ | SQL（我们的扩展，走 Calcite） |
-| IN 子查询 | ✅ | ❌ | SQL（回退 Legacy V1 Hash Join） |
+| IN 子查询 | ✅ | ❌ | SQL（回退 Legacy V1 IN→JOIN 重写） |
 | EXISTS 子查询 | ⚠️ | ❌ | SQL 普通 EXISTS 报错 "Unsupported subquery"（`SubQueryRewriter.java:74`）；嵌套字段 EXISTS 支持（`NestedExistsRewriter.java`，`canRewrite()` 仅对嵌套字段返回 true） |
+| 标量子查询 | ⚠️ | ❌ | SQL V2 报 `Subsearch is supported only when plugins.calcite.enabled=true`（`ExpressionAnalyzer.java:470`）；Calcite 引擎支持但 SQL 默认不路由到此 |
 | 派生表 | ✅ | ❌ | SQL `(SELECT...) AS t` |
 | CTE (WITH) | ❌ | ❌ | 文法无 WITH 规则（`OpenSearchSQLLexer.g4` 无 WITH token）；Legacy 报错 "Query must start with SELECT, DELETE, SHOW or DESCRIBE"（`OpenSearchActionFactory.java:135`），V2 抛 ANTLR 语法错误 |
 | COALESCE | ❌ | ✅ | V2 引擎报错 "unsupported function name: coalesce"（`BuiltinFunctionRepository.java:145`，函数注册表缺失）；Legacy 报错 "not supported in Schema"（`SelectResultSet.java:360`） |
@@ -261,18 +264,18 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 #### A 组：点查
 
-| 场景 | SQL 查询 | DSL 查询 |
-|------|---------|---------|
-| A1 等值(单条件) | `SELECT * FROM perf_test WHERE status_code = 200 LIMIT 10` | `{"query":{"term":{"status_code":200}},"size":10}` |
-| A2 等值(多条件) | `SELECT * FROM perf_test WHERE status_code = 500 AND level = 'ERROR' AND region = 'us-east-1' LIMIT 10` | `{"query":{"bool":{"filter":[{"term":{"status_code":500}},{"term":{"level":"ERROR"}},{"term":{"region":"us-east-1"}}]}},"size":10}` |
-| A3 范围 | `SELECT * FROM perf_test WHERE response_time_ms > 3000 AND status_code = 500 LIMIT 10` | `{"query":{"bool":{"filter":[{"range":{"response_time_ms":{"gt":3000}}},{"term":{"status_code":500}}]}},"size":10}` |
+| 场景 | SQL 查询 | DSL 查询 | 引擎路径 |
+|------|---------|---------|:---:|
+| A1 等值(单条件) | `SELECT * FROM perf_test WHERE status_code = 200 LIMIT 10` | `{"query":{"term":{"status_code":200}},"size":10}` | V2 |
+| A2 等值(多条件) | `SELECT * FROM perf_test WHERE status_code = 500 AND level = 'ERROR' AND region = 'us-east-1' LIMIT 10` | `{"query":{"bool":{"filter":[{"term":{"status_code":500}},{"term":{"level":"ERROR"}},{"term":{"region":"us-east-1"}}]}},"size":10}` | V2 |
+| A3 范围 | `SELECT * FROM perf_test WHERE response_time_ms > 3000 AND status_code = 500 LIMIT 10` | `{"query":{"bool":{"filter":[{"range":{"response_time_ms":{"gt":3000}}},{"term":{"status_code":500}}]}},"size":10}` | V2 |
 
 #### B 组：全文搜索
 
-| 场景 | SQL 查询 | DSL 查询 |
-|------|---------|---------|
-| B1 简单 | `SELECT message, service FROM perf_test WHERE match(message, 'timeout') LIMIT 10` | `{"query":{"match":{"message":"timeout"}},"size":10,"_source":["message","service"]}` |
-| B2 多字段 | `SELECT * FROM perf_test WHERE MULTI_MATCH(message, 'request failed') AND level = 'ERROR' LIMIT 10` | `{"query":{"bool":{"must":[{"match":{"message":"request failed"}}],"filter":[{"term":{"level":"ERROR"}}]}},"size":10}` |
+| 场景 | SQL 查询 | DSL 查询 | 引擎路径 |
+|------|---------|---------|:---:|
+| B1 简单 | `SELECT message, service FROM perf_test WHERE match(message, 'timeout') LIMIT 10` | `{"query":{"match":{"message":"timeout"}},"size":10,"_source":["message","service"]}` | V2 |
+| B2 多字段 | `SELECT * FROM perf_test WHERE MULTI_MATCH(message, 'request failed') AND level = 'ERROR' LIMIT 10` | `{"query":{"bool":{"must":[{"match":{"message":"request failed"}}],"filter":[{"term":{"level":"ERROR"}}]}},"size":10}` | V2 |
 
 #### C 组：聚合（随机阈值打散缓存 + 每轮 `_cache/clear`）
 
@@ -281,12 +284,12 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 > - **对等方案 B**：SQL 加 `ORDER BY COUNT(*) DESC`，触发 `AggPushDownAction.rePushDownSortAggMeasure`（line 133-190）将 composite 转为 terms；同时 DSL terms 显式设 `size` 与 SQL 一致
 > - 下方 C1/C3 用方案 B（含 ORDER BY，触发 terms 转换）；C2 多级聚合无 ORDER BY，用方案 A（DSL 改 composite）
 
-| 场景 | SQL 查询 | DSL 查询 |
-|------|---------|---------|
-| C1 简单 | `SELECT level, COUNT(*) as cnt FROM perf_test WHERE response_time_ms > {random} GROUP BY level ORDER BY cnt DESC` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":{random}}}},"aggs":{"by_level":{"terms":{"field":"level","size":1000,"order":{"_count":"desc"}}}}}` |
-| C2 多级 | `SELECT level, service, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt FROM perf_test WHERE response_time_ms > {random} GROUP BY level, service` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":{random}}}},"aggs":{"ls":{"composite":{"size":1000,"sources":[{"level":{"terms":{"field":"level"}}},{"service":{"terms":{"field":"service"}}}]},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}}}}}}` |
-| C3 范围+排序 | `SELECT service, COUNT(*) as cnt FROM perf_test WHERE response_time_ms > {random} GROUP BY service ORDER BY cnt DESC` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":{random}}}},"aggs":{"by_service":{"terms":{"field":"service","size":1000,"order":{"_count":"desc"}}}}}` |
-| C4 时间直方图 | SQL 不支持（DATE_HISTOGRAM V2 无此函数，Legacy 支持） | `{"size":0,"aggs":{"by_hour":{"date_histogram":{"field":"@timestamp","calendar_interval":"1h"}}}}` |
+| 场景 | SQL 查询 | DSL 查询 | 引擎路径 |
+|------|---------|---------|:---:|
+| C1 简单 | `SELECT level, COUNT(*) as cnt FROM perf_test WHERE response_time_ms > {random} GROUP BY level ORDER BY cnt DESC` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":{random}}}},"aggs":{"by_level":{"terms":{"field":"level","size":1000,"order":{"_count":"desc"}}}}}` | V2 |
+| C2 多级 | `SELECT level, service, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt FROM perf_test WHERE response_time_ms > {random} GROUP BY level, service` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":{random}}}},"aggs":{"ls":{"composite":{"size":1000,"sources":[{"level":{"terms":{"field":"level"}}},{"service":{"terms":{"field":"service"}}}]},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}}}}}}` | V2 |
+| C3 范围+排序 | `SELECT service, COUNT(*) as cnt FROM perf_test WHERE response_time_ms > {random} GROUP BY service ORDER BY cnt DESC` | `{"size":0,"query":{"range":{"response_time_ms":{"gt":{random}}}},"aggs":{"by_service":{"terms":{"field":"service","size":1000,"order":{"_count":"desc"}}}}}` | V2 |
+| C4 时间直方图 | SQL 不支持（DATE_HISTOGRAM V2 无此函数，Legacy 支持） | `{"size":0,"aggs":{"by_hour":{"date_histogram":{"field":"@timestamp","calendar_interval":"1h"}}}}` | V2（不支持）/ Legacy（支持） |
 
 #### D 组：排序与分页
 
@@ -296,19 +299,19 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 > ⚠️ **D4 游标机制不对等**：SQL `fetch_size` 走 **PIT + searchAfter**（`OpenSearchRequestBuilder.build()` line 147-156 创建 PIT，`searchWithPIT` line 245-296 强制加 `_shard_doc` 排序，有状态）；DSL 走裸 `search_after`（无状态）。**这是不同机制的对比**（有状态 vs 无状态），不参与"SQL 翻译开销"结论，仅作为生产方案参考。
 
-| 场景 | SQL 查询 | DSL 查询 |
-|------|---------|---------|
-| D1 排序+小分页 | `SELECT * FROM perf_test ORDER BY response_time_ms DESC LIMIT 10` | `{"query":{"match_all":{}},"sort":[{"response_time_ms":"desc"}],"size":10}` |
-| D2 深度分页 | `SELECT * FROM perf_test ORDER BY response_time_ms DESC LIMIT 10000, 10` | `{"query":{"match_all":{}},"sort":[{"response_time_ms":"desc"}],"from":10000,"size":10}` |
-| D3 大结果集 | `SELECT * FROM perf_test WHERE status_code = 200 LIMIT 1000` | `{"query":{"term":{"status_code":200}},"size":1000}` |
-| D4 游标分页（机制不同，仅作生产方案参考） | `{"query":"SELECT * FROM perf_test WHERE status_code = 200","fetch_size":100}` | `{"query":{"term":{"status_code":200}},"sort":[{"_id":"asc"}],"size":100}` + `search_after` |
+| 场景 | SQL 查询 | DSL 查询 | 引擎路径 |
+|------|---------|---------|:---:|
+| D1 排序+小分页 | `SELECT * FROM perf_test ORDER BY response_time_ms DESC LIMIT 10` | `{"query":{"match_all":{}},"sort":[{"response_time_ms":"desc"}],"size":10}` | V2 |
+| D2 深度分页 | `SELECT * FROM perf_test ORDER BY response_time_ms DESC LIMIT 10000, 10` | `{"query":{"match_all":{}},"sort":[{"response_time_ms":"desc"}],"from":10000,"size":10}` | V2（可能回退内存分页） |
+| D3 大结果集 | `SELECT * FROM perf_test WHERE status_code = 200 LIMIT 1000` | `{"query":{"term":{"status_code":200}},"size":1000}` | V2 |
+| D4 游标分页（机制不同，仅作生产方案参考） | `{"query":"SELECT * FROM perf_test WHERE status_code = 200","fetch_size":100}` | `{"query":{"term":{"status_code":200}},"sort":[{"_id":"asc"}],"size":100}` + `search_after` | V2（PIT+searchAfter） |
 
 #### E 组：SQL 独有（架构差异对比，非引擎效率对比）
 
 > ⚠️ **对比目标说明**：E 组对比的是**架构差异**（SQL 单次请求内存计算 vs DSL 多次请求+客户端合并），**不是引擎翻译效率**。E 组数据不参与"SQL 翻译开销占比"结论。
 > - E1 UNION：SQL 走 Calcite 在协调节点内存合并（`CalciteRelNodeVisitor.java:2980`）；DSL 需 2 次网络往返+应用层合并——对比的是**单次 vs 多次请求**
 > - E2 JOIN：SQL 走 Calcite 内存 JOIN（有 `join.subsearch_maxout` 系统限制，`CalciteRelNodeVisitor.java:1923`）；DSL 应用层方案非原子、有客户端上限——**语义不等价**
-> - E3 IN 子查询：SQL 回退 Legacy V1 Hash Join（`InRewriter.java:24`）；DSL 应用层方案需先查子查询再 terms——**语义不等价**
+> - E3 IN 子查询：SQL 回退 Legacy V1 IN→JOIN 重写（`InRewriter.java:24`）；DSL 应用层方案需先查子查询再 terms——**语义不等价**
 > - ⚠️ E 组走 Calcite 引擎，WHERE 生成 `bool.must`（会打分），DSL 用 `bool.filter`（不打分）——E 组 SQL 额外开销含评分开销，非纯翻译开销
 
 | 场景 | SQL 查询 | DSL 等价（多次查询+应用层合并，语义不等价） | 引擎 |
@@ -324,6 +327,7 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | F1 冷启动 | `SELECT /* cold_run_{timestamp} */ * FROM perf_test WHERE status_code = 200 LIMIT 10` | 每轮唯一注释打散计划缓存 |
 | F2 Pushdown on/off | 同 E1 查询，分别 `plugins.calcite.pushdown.enabled=true/false` | 隔离下推收益 |
 | F3 结果等价 | 对每个场景的 SQL 和 DSL 结果集做行数+值比对 | TPC 标准 |
+| F4 配置参数敏感性 | `plugins.query.buckets` ∈ {100, 1000, 10000} × C1 场景 | 验证 composite 分页 size 对聚合延迟的影响 |
 
 #### G0 组：纯翻译开销基线（隔离测量）
 
@@ -335,7 +339,7 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | G0-1 点查 | `SELECT * FROM perf_test WHERE status_code = 200 LIMIT 10` | `_explain` + profile API 提取 ANALYZE 耗时 | 2-7ms |
 | G0-2 聚合 | `SELECT level, COUNT(*) FROM perf_test WHERE response_time_ms > 100 GROUP BY level ORDER BY COUNT(*) DESC` | 同上 | 3-10ms |
 | G0-3 UNION | 同 E1 查询 | 同上 | 5-18ms（含 Calcite 优化器） |
-| G0-4 JOIN | 同 E2 查询 | `_explain` 验证回退 Legacy，测 Druid 解析耗时 | 2-6ms |
+| G0-4 JOIN | 同 E2 查询 | `_explain` 验证回退 Legacy V1（确认不经过 V2 ANALYZE）。Druid 解析耗时改用方法 B（slowlog 交叉验证）估算，精度 ±1ms，仅作量级参考 | 2-6ms（估算） |
 
 > G0 组数据用于：① 验证端到端延迟差 ≈ 翻译开销 + 序列化开销 + 网络/排队；② 作为"翻译开销本身可接受"的直接证据；③ 与 4.7 节预期矩阵的"SQL 额外开销"列交叉验证。
 
@@ -343,14 +347,18 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 > **目的**：在同一集群、同一 schema、同一配置下，用相同查询控制命中数据量，验证"小数据量劣化比例大、大数据量劣化比例小"的趋势。
 > **方法**：在 10M 集群上，通过 `WHERE` 条件控制命中行数（1K / 100K / 1M / 10M），用相同 SQL 和 DSL 查询跑 ≥1000 轮，观察劣化比例变化。
+> 
+> ⚠️ **缓存控制**：T 组每个子场景用**随机阈值微调**（如 T1-1K 用 `response_time_ms > 9900 ± 50`），打散缓存同时保持命中行数 ≈1K。
+> ⚠️ **缓存命中率监控**：每轮记录 SQL/DSL 侧 `indices/query_cache/hit_count`，若 SQL 侧命中率显著高于 DSL 侧，标注「缓存偏差」。
 
-| 场景 | 命中行数 | SQL 查询 | DSL 查询 | 预期趋势 |
-|------|:---:|---------|---------|---------|
-| T1-1K | ~1K | `SELECT * FROM perf_test_10m WHERE status_code = 200 AND response_time_ms > 9900 LIMIT 10` | `{"query":{"bool":{"filter":[{"term":{"status_code":200}},{"range":{"response_time_ms":{"gt":9900}}}]},"size":10}` | 劣化比例最大（翻译开销占比高） |
-| T1-100K | ~100K | `SELECT * FROM perf_test_10m WHERE status_code = 200 AND response_time_ms > 5000 LIMIT 10` | 同结构，阈值 5000 | 劣化比例中 |
-| T1-1M | ~1M | `SELECT * FROM perf_test_10m WHERE status_code = 200 LIMIT 10` | `{"query":{"term":{"status_code":200}},"size":10}` | 劣化比例小 |
-| T2-聚合-1K桶 | ~1K 桶 | `SELECT service, COUNT(*) FROM perf_test_10m WHERE response_time_ms > 100 GROUP BY service ORDER BY COUNT(*) DESC` | terms agg size=1000 | 劣化比例随桶数变化 |
-| T2-聚合-100K桶 | ~100K 桶 | `SELECT user_id, COUNT(*) FROM perf_test_10m WHERE response_time_ms > 100 GROUP BY user_id ORDER BY COUNT(*) DESC` | terms agg size=1000 | 劣化比例小（DSL 耗时大） |
+| 场景 | 命中行数 | SQL 查询 | DSL 查询 | 预期趋势 | 预期劣化比例 |
+|------|:---:|---------|---------|---------|:---:|
+| T1-1K | ~1K | `SELECT * FROM perf_test_10m WHERE status_code = 200 AND response_time_ms > 9900 LIMIT 10` | `{"query":{"bool":{"filter":[{"term":{"status_code":200}},{"range":{"response_time_ms":{"gt":9900}}}]},"size":10}` | 劣化比例最大（翻译开销占比高） | 50-80% |
+| T1-100K | ~100K | `SELECT * FROM perf_test_10m WHERE status_code = 200 AND response_time_ms > 5000 LIMIT 10` | 同结构，阈值 5000 | 劣化比例中 | 20-40% |
+| T1-1M | ~1M | `SELECT * FROM perf_test_10m WHERE status_code = 200 LIMIT 10` | `{"query":{"term":{"status_code":200}},"size":10}` | 劣化比例小 | 5-15% |
+| T1-10M | ~10M | `SELECT * FROM perf_test_10m LIMIT 10` | `{"query":{"match_all":{}},"size":10}` | 劣化比例最小（DSL 主导） | 1-5% |
+| T2-聚合-1K桶 | ~1K 桶 | `SELECT service, COUNT(*) FROM perf_test_10m WHERE response_time_ms > 100 GROUP BY service ORDER BY COUNT(*) DESC` | terms agg size=1000 | 劣化比例随桶数变化 | — |
+| T2-聚合-100K桶 | ~100K 桶 | `SELECT user_id, COUNT(*) FROM perf_test_10m WHERE response_time_ms > 100 GROUP BY user_id ORDER BY COUNT(*) DESC` | terms agg size=1000 | 劣化比例小（DSL 耗时大） | — |
 
 > T 组是验证核心结论的关键：**如果 T 组数据显示劣化比例随数据量增大而减小，则结论成立；否则结论不成立**。T 组与 G0 组交叉验证——G0 测纯翻译开销（应恒定），T 组测端到端劣化比例（应随数据量减小）。
 
@@ -403,14 +411,7 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 > 目标：验证"大数据量重查询下 SQL 与 DSL 性能差异不大"。
 > **环境与 4.1 节统一配置完全一致**（3 节点 6 shard 1 replica 13 字段含高基数），此处仅补充生产级测试的额外控制项。4.2/4.3 节的场景在 1M 和 10M 上都跑（相同查询，表名 `perf_test` / `perf_test_10m`），直接对比劣化比例变化。
 
-#### 额外控制项
-
-```
-slowlog threshold.query.warn: 0ms（仅 warn 级别，避免 info 级每查询同步写盘引入 1-5ms 抖动）
-所有查询加 ?preference=_primary（消除 replica 路由差异）
-测试窗口停止 indexing + translog durability=async + merge.scheduler.max_thread_count=1（隔离后台噪声）
-每轮之间 _cache/clear（见 4.6 节缓存控制，SQL 路径无法禁用 request cache）
-```
+> 额外控制项见 4.6 节注意事项。
 
 #### 场景组 G：生产典型重查询
 
@@ -541,17 +542,17 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 
 | 场景 | 预期 DSL (ms) | 预期 SQL 额外开销 (ms) | 预期开销占比 | 说明 |
 |------|:---:|:---:|:---:|------|
-| A1 点查 | 1-5 | 2-7 | 29-88% | DSL=1+额外=2→67%；DSL=5+额外=2→29%；DSL=1+额外=7→88% |
-| B1 全文搜索 | 3-10 | 2-7 | 17-70% | DSL=3+额外=2→40%；DSL=10+额外=2→17%；DSL=3+额外=7→70% |
-| C1 聚合 | 5-20 | 5-15 | 20-75% | DSL=5+额外=5→50%；DSL=20+额外=5→20%；DSL=5+额外=15→75% |
+| A1 点查 | 3-8 | 2-7 | 20-47% | DSL=3+额外=2→40%；DSL=8+额外=2→20%；DSL=8+额外=7→47%（3 节点 scatter-gather 提升 DSL 基线） |
+| B1 全文搜索 | 5-12 | 2-7 | 17-70% | DSL=3+额外=2→40%；DSL=10+额外=2→17%；DSL=3+额外=7→70% |
+| C1 聚合 | 8-25 | 5-15 | 20-75% | DSL=5+额外=5→50%；DSL=20+额外=5→20%；DSL=5+额外=15→75% |
 | D2 深度分页 | 50-200 | 5-15 | 2-23% | DSL=50+额外=5→9%；DSL=200+额外=5→2%；DSL=50+额外=15→23%（仅 maxResultWindow 调大时有效） |
 | D3 大结果集 | 10-30 | 10-20（含序列化 5-15） | 25-67% | DSL=10+额外=10→50%；DSL=30+额外=10→25%；DSL=10+额外=20→67% |
 | E1 UNION(pushdown ON) | 无 DSL 对照 | 5-20 (冷启动含 codegen 30-80) | — | SQL 端到端绝对值（含 Calcite bool.must 评分开销） |
-| E2 JOIN | 无 DSL 对照 | 200-500 (SQL 端到端) | — | Legacy V1 Hash Join，10K 行内存计算 |
-| G0 纯翻译开销 | — | 2-18（G0 组实测） | — | 用 `_explain` + profile API 隔离测量，不经过网络/序列化 |
+| E2 JOIN | 无 DSL 对照 | 200-500 (SQL 端到端) | — | Legacy V1 IN→JOIN 重写，10K 行内存计算 |
+| G0 纯翻译开销 | — | G0-1 点查 2-7ms / G0-2 聚合 3-10ms / G0-3 UNION 5-18ms / G0-4 JOIN 2-6ms（估算） | — | 用 `_explain` + profile API 隔离测量，不经过网络/序列化 |
 | G1 10M 聚合 | 300-600 | 5-15 (稳态) / 30-80 (冷启动含 codegen) | 1-5% / 5-13% | 区分冷启动 vs 稳态 |
-| H1 10M 高基数聚合 | 800-2000 (或 OOM) | 10-30 | 0.5-3% | 500K 桶可能触发 circuit breaker |
-| T 组趋势 | 见 T 组表 | 见 T 组表 | 随数据量减小 | 验证"小数据劣化大、大数据劣化小"核心结论 |
+| H1 10M 高基数聚合 | 800-2000 (或 OOM) | 10-30 | 0.5-3% | 500K 桶 10M 数据可能触发 breaker；1M 数据无 OOM 风险，预期 DSL 200-500ms |
+| T 组趋势 | 见 T 组表 | 见 T 组表 | 随数据量减小 | 验证"小数据劣化大、大数据劣化小"核心结论。⚠️ 缓存偏差方向：SQL 侧受益更多，劣化比例可能被低估 5-15% |
 
 ### 4.8 生产关键场景补充
 
@@ -579,6 +580,27 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 | I5 超时降级 | SQL 查询设置 30s 超时 + 并发 | 超时后 sql-worker 线程是否释放，是否泄漏 |
 
 > 并发测试必须混合 SQL + DSL 负载（如 50% SQL + 50% DSL），观察资源隔离。原方案仅测同质负载吞吐量，无法发现资源穿透问题。
+
+### 4.9 结果正确性验证
+
+> 性能对比的前提是 SQL 与 DSL 结果**语义等价**。以下判据定义每个场景的等价性标准；不等价的场景**仅参与性能对比，不参与正确性结论**。
+
+| 场景组 | 等价性判据 | 顺序敏感性 | 已知不等价 | 正确性结论参与 |
+|--------|---------|:---:|---------|:---:|
+| A 组（点查） | 行数 + 值集合完全一致（顺序无关，因 `LIMIT` 无 `ORDER BY` 时两者顺序可能不同） | 否 | 无 | ✅ 参与 |
+| B 组（全文搜索） | 行数 + `_id` 集合一致；`_score` 不要求一致（DSL `match` 打分 vs SQL V2 路径） | 否 | 评分差异（不影响命中集合） | ✅ 参与（仅行集合） |
+| C 组（聚合） | 桶 key 集合 + 每桶度量值一致（容差 1e-9 浮点）；排序后比对 | 是（按桶 key 排序后比对） | C2 多级聚合若 SQL 用 composite、DSL 用 terms，桶数可能不同（见 4.2 对等方案） | ⚠️ C2 需对等方案 A（DSL 改 composite）后才参与 |
+| D 组（排序分页） | 行数 + 值集合 + 顺序完全一致（含 `ORDER BY`） | 是 | D2 深度分页 SQL 可能回退内存分页（结果等价但路径不同）；D4 游标机制不同（PIT vs 裸 search_after） | ⚠️ D2 仅 maxResultWindow 调大时参与；D4 **仅性能对比，不参与正确性结论** |
+| E 组（SQL 独有） | DSL 无严格等价物（多次查询+应用层合并） | — | E1 UNION 合并顺序、E2/E3 JOIN 语义不等价 | ❌ **仅性能对比，不参与正确性结论** |
+| G0 组（纯翻译基线） | 不涉及（仅测翻译阶段耗时） | — | — | ❌ 不参与 |
+| T 组（趋势验证） | 同 A 组判据（点查子集） | 否 | 无 | ✅ 参与 |
+| G/H 组（重查询） | 同 C 组判据（聚合）或 A 组判据（点查） | 视场景 | H1 500K 桶可能触发 breaker 导致结果不完整 | ⚠️ 需确认 breaker 未触发后才参与 |
+| I 组（失败恢复） | 不涉及（仅测资源隔离/恢复） | — | — | ❌ 不参与 |
+| D5 组（深翻页生产方案） | SQL 游标 vs DSL PIT/search_after 各自完整性校验（行数总和 = 总匹配数） | — | 机制不同，无交叉等价 | ❌ **仅性能对比，不参与正确性结论** |
+
+> **验证方法**：每个场景首次运行时执行 F3（结果等价验证），记录行数、值集合（点查）、桶 key+度量（聚合）。后续性能轮次不再重复验证（避免影响计时）。
+> 
+> ⚠️ **不等价场景清单**（仅性能对比，不参与正确性结论）：E 组（E1/E2/E3）、D4 游标分页、D5 深翻页生产方案、I 组失败恢复。这些场景的 SQL 与 DSL 语义不同，性能差异反映的是**架构差异**而非**翻译效率**。
 
 ---
 
@@ -808,7 +830,7 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 | 1M / 单节点 | OS 3.0 单节点 Big5 geo mean 16ms；Trail of Bits OS 2.17 单节点 terms agg 105ms | DSL | 单节点 DSL 基线合理 |
 | 10M / 3 节点, 预期 DSL 300–2000ms | OS 3.5 vector 3 节点 10M p99 91–330ms；AWS OR1 3 节点 247M multi_term p99 4.2s | DSL | "预期 DSL"落在合理区间 |
 | **30+ 节点外推** | ES Issue #112306: 50K shard 时 shard 解析成瓶颈；Star graph 模型 | DSL | **不能线性外推**；协调节点聚合开销 log 增长 |
-| **1B+ 文档外推** | Elastic 推荐 200M docs/shard → 1B 需 5+ shard；AWS 247M multi_term p99 4.2s | DSL | 1B 文档预计 DSL multi_term agg p99 10–30s |
+| **1B+ 文档外推** | Elastic 推荐 200M docs/shard → 1B 需 5+ shard；AWS 247M multi_term p99 4.2s | DSL | **不可定量外推**；247M/3 节点 p99=4.2s 仅作量级参考，1B 需 10+ 节点，拓扑变化使线性外推无效 |
 | **SQL 插件 overhead** | OS 3.3 PPL Calcite 160x faster；750B 文档 PPL span 慢 100x | PPL | **版本依赖性强**；PPL≠SQL，SQL 大规模表现需独立验证 |
 | **Circuit breaker** | fielddata 40% heap 默认；parent 95% heap | 不区分 | 8 GB heap 节点高基数聚合易触发，生产建议 32+ GB |
 | **Forcemerge 收益** | Intra-segment RFC：单 segment 重聚合提升 76%（单 client），8 clients 无收益 | DSL | 只读索引可 forcemerge；写入活跃索引无收益 |
@@ -829,12 +851,12 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 
 | 测试规模 | 节点数 | 文档数 | 可外推到的生产规模 | 限制 |
 |---------|:---:|:---:|------|------|
-| 1M 单节点 | 1 | 1M | 单节点小规模部署 | 无 scatter-gather、无网络、无跨 shard merge |
+| 1M / 3 节点 | 3 | 1M | 3-10 节点中等规模（小数据量基线） | 延迟小（1-10ms），需高精度计时+≥2000 轮样本支撑 p99 |
 | 10M 3 节点 | 3 | 10M | 3-10 节点中等规模 | 3 节点统计上接近 p33，无法体现 30+ 节点长尾 |
 | 生产 30+ 节点 | 30+ | 1B+ | — | 协调节点 merge 100 分片响应，网络 RTT 主导 |
 
 **核心结论**：
-- 1M 单节点 + 10M 3 节点的测试**只能证明各自规模内 SQL vs DSL 的相对开销比例**
+- 1M/3 节点 + 10M/3 节点（统一配置，仅数据量不同）的测试**只能证明各自规模内 SQL vs DSL 的相对开销比例**
 - **不可外推到 30+ 节点生产集群**——生产规模下网络 RTT 和协调节点 merge 开销主导，SQL 翻译开销相对值趋近于 0
 - 扩展性结论必须引用 OpenSearch 官方基准交叉验证（见第六章）
 
@@ -908,14 +930,24 @@ ROI = (开发效率提升 × 开发人天单价) / (翻译开销 × 查询QPS ×
 | 45 | composite size=1000 分页拉取 | 可配置 `plugins.query.buckets`，默认 = `MAX_RESULT_WINDOW` (10000) | `OpenSearchSettings.java:205-211`, `AggregateAnalyzer.java:296` |
 | 134 | 静默回退到 V2 | WARN 级别日志回退，默认仅 `CalciteUnsupportedException` 触发 | `QueryService.java:180-186` |
 | 152 | sql-worker (8线程) | sql-worker (=allocatedProcessors, 8核→8线程) | `SQLPlugin.java:443-449` |
-| 162/425 | SQL 路径不尊守 request_cache=false | 补充根因：`responseParams` 不含 `request_cache`，`OpenSearchRequestBuilder` 不设 `requestCache` | `RestSqlAction.java:242-248` |
+| 162/425 | SQL 路径不尊守 request_cache=false | 补充根因：`responseParams` 不含 `request_cache`，`OpenSearchQueryRequest.search()` 不设 `requestCache` | `RestSqlAction.java:242-248` |
 | 189/214 | DATE_HISTOGRAM NPE 崩溃 | INTERVAL 处理已知 bug（`RexStandardizer.java:117`），基于实测观察 | `RexStandardizer.java:117`, `AggSpec.java:42` |
 
 方法论修正：
-- 4.1 表 vs 4.4 节节点数矛盾统一为两阶段测试（1M 单节点 + 10M 3 节点）
+- 4.1 表 vs 4.4 节节点数矛盾统一为统一配置测试（1M/3 节点 + 10M/3 节点，仅数据量不同）
 - 4.4 节 slowlog `threshold.query.info: 0ms` 改为 `warn: 0ms`（避免每查询同步写盘引入抖动）
 - 4.5 节样本量 200 轮→≥2000 轮（支撑 p99 置信区间），预热改用 `-XX:+PrintCompilation` 沉默判断
 - 4.6 节补充三大缓存控制（shard query cache / fielddata cache / OS page cache）+ `?preference=_primary`
 - 4.7 表数学不闭合修正 + E 组标注"无 DSL 对照"
 - 4.8 节新增生产关键场景（D5 PIT/async search + I 组失败恢复）
 - 翻译开销分解方法从 `T_sql - T_slowlog` 改为 SQLService 内部 `ProfileMetric ANALYZE` 埋点
+
+结构性修改（用于追溯本次评审引入的章节级变更）：
+
+| 提交 | 修改内容 | 影响章节 |
+|------|---------|---------|
+| a1a151e75 | 第六章路径归属澄清（区分 DSL/PPL/SQL） | 6.1/6.7/6.8 |
+| 382655cf6 | 删除 2.4 节「缓存公平性」第 6 点 | 2.4 |
+| f56ec7b80 | 3.3 节标量子查询根因改为 getOnlyForCalciteException | 3.3 |
+| 17b5bcf00 | 第四章场景对等性修正 + 新增 G0/T 组 | 4.2/4.7 |
+| 041cdf569 | 统一 1M/10M 配置（都 3 节点） | 4.1/4.4/7.1 |
