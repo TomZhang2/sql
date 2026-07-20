@@ -163,7 +163,6 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 3. **游标**——DSL `search_after`（无状态）vs V2 序列化游标（有状态）vs Calcite `EnumerableLimit`
 4. **无计划缓存**——每次查询重新解析+规划
 5. **Calcite 内存风险**——UNION/JOIN 在协调节点单线程，大数据量可能 OOM
-6. **缓存公平性**——SQL 路径不尊守 `request_cache=false`（根因：`RestSqlAction.responseParams()` 不含 `request_cache`，`OpenSearchRequestBuilder` 不设 `requestCache`，URL 参数被静默忽略），filter cache 对 SQL 生效；基准测试需用随机阈值打散
 
 ---
 
