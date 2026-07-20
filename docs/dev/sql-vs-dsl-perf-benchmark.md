@@ -181,15 +181,15 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | 窗口函数 | ✅ | ❌ | SQL `RANK() OVER(...)`; DSL 不支持 |
 | 2 表 JOIN | ✅ | ❌ | SQL（回退 Legacy V1）; DSL 不支持 |
 | 3 表+ JOIN | ❌ | ❌ | SQL 报错 "only 2 tables" |
-| JOIN + GROUP BY | ❌ | ❌ | SQL 报错 "no aggregations" |
+| JOIN + GROUP BY | ❌ | ❌ | SQL 报错 "JOIN queries do not support aggregations on the joined result."（`Util.java:44`） |
 | UNION ALL | ✅ | ❌ | SQL（我们的扩展，走 Calcite） |
 | UNION DISTINCT | ✅ | ❌ | SQL（我们的扩展，走 Calcite） |
 | IN 子查询 | ✅ | ❌ | SQL（回退 Legacy V1 Hash Join） |
-| EXISTS 子查询 | ❌ | ❌ | SQL 报错 "Unsupported subquery" |
+| EXISTS 子查询 | ⚠️ | ❌ | SQL 普通 EXISTS 报错 "Unsupported subquery"（`SubQueryRewriter.java:74`）；嵌套字段 EXISTS 支持（`NestedExistsRewriter.java`，`canRewrite()` 仅对嵌套字段返回 true） |
 | 派生表 | ✅ | ❌ | SQL `(SELECT...) AS t` |
-| CTE (WITH) | ❌ | ❌ | SQL 报错 "must start with SELECT" |
-| COALESCE | ❌ | ✅ | SQL 报错 "not supported in Schema" |
-| DATE_HISTOGRAM | ❌ | ✅ | SQL 在 INTERVAL 参数场景崩溃（V2 `AggSpec.DATE_HISTOGRAM` 枚举存在，但 INTERVAL 处理有已知 bug，见 `RexStandardizer.java:117` 注释；基于实测观察） |
+| CTE (WITH) | ❌ | ❌ | 文法无 WITH 规则（`OpenSearchSQLLexer.g4` 无 WITH token）；Legacy 报错 "Query must start with SELECT, DELETE, SHOW or DESCRIBE"（`OpenSearchActionFactory.java:135`），V2 抛 ANTLR 语法错误 |
+| COALESCE | ❌ | ✅ | V2 引擎报错 "unsupported function name: coalesce"（`BuiltinFunctionRepository.java:145`，函数注册表缺失）；Legacy 报错 "not supported in Schema"（`SelectResultSet.java:360`） |
+| DATE_HISTOGRAM | ❌ | ✅ | V2 引擎无 DATE_HISTOGRAM 函数注册；Legacy 实际支持（`AggMaker.java:558-611`，含 interval/fixed_interval/format/time_zone 等参数）；V2 INTERVAL 参数处理有已知 bug（`RexStandardizer.java:117` 注释），基于实测观察 |
 | 脚本字段 | ❌ | ✅ | DSL `script_fields` |
 | 运行时字段 | ❌ | ✅ | DSL `runtime_mappings` |
 | profile API | ❌ | ✅ | DSL `profile: true` |
@@ -208,13 +208,13 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 | 限制 | 错误信息 | 根因 |
 |------|---------|------|
-| CTE | `Query must start with SELECT` | 文法无 WITH 规则 |
-| 3 表+ JOIN | `only 2 tables join` | Legacy V1 限制 |
-| JOIN + GROUP BY | `no aggregations on joined result` | Legacy V1 限制 |
-| EXISTS 子查询 | `Unsupported subquery` | V2 不支持 |
-| 标量子查询 | `unknown field name` | Druid 限制 |
-| COALESCE | `not supported in Schema` | V2 函数注册表缺失 |
-| DATE_HISTOGRAM | NPE | V2 INTERVAL 参数处理已知 bug（`RexStandardizer.java:117` 注释 "INTERVAL_TYPES has bug, introduced by calcite-1.41.1"），基于实测观察 |
+| CTE | Legacy: `Query must start with SELECT, DELETE, SHOW or DESCRIBE`（`OpenSearchActionFactory.java:135`）；V2: ANTLR 语法错误 | 文法无 WITH 规则（`OpenSearchSQLLexer.g4` 无 WITH token） |
+| 3 表+ JOIN | `currently supports only 2 tables join`（`SqlParser.java:380`） | Legacy V1 限制 |
+| JOIN + GROUP BY | `JOIN queries do not support aggregations on the joined result.`（`Util.java:44`） | Legacy V1 限制 |
+| EXISTS 子查询 | 普通: `Unsupported subquery`（`SubQueryRewriter.java:74`）；嵌套字段: 实际支持（`NestedExistsRewriter.java`） | V2 抛 `getOnlyForCalciteException` 回退 Legacy；Legacy 仅支持嵌套字段 EXISTS |
+| 标量子查询 | V2: `Subsearch is supported only when plugins.calcite.enabled=true`（`ExpressionAnalyzer.java:470`）；Legacy: `unknown field name`（`FieldMaker.java:67`） | V2 引擎仅 Calcite 路径支持（SQL 仅 UNION 走 Calcite）；Legacy 受限于 Alibaba Druid SQL 解析器库 |
+| COALESCE | V2: `unsupported function name: coalesce`（`BuiltinFunctionRepository.java:145`）；Legacy: `not supported in Schema`（`SelectResultSet.java:360`） | V2 函数注册表未注册 COALESCE（`BuiltinFunctionRepository.java:73-85`） |
+| DATE_HISTOGRAM | V2 无此函数；INTERVAL 参数处理有已知 bug | V2 core 无 DATE_HISTOGRAM 函数注册；`RexStandardizer.java:117` 注释 "INTERVAL_TYPES has bug, introduced by calcite-1.41.1"；Legacy 实际支持（`AggMaker.java:558-611`） |
 
 ---
 
