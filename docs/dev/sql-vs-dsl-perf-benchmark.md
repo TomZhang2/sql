@@ -222,21 +222,32 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 ### 4.1 测试环境
 
-> **两阶段测试**：1M 单节点用于隔离翻译开销（轻/重查询）；10M 3 节点用于生产级验证（详见 4.4 节）。两者使用不同 schema/shard/forcemerge 策略，**结构性不可比**，不可直接推论扩展性规律。
+> **统一配置原则（关键）**：1M 和 10M 测试使用**相同 schema、相同集群配置、相同 forcemerge 策略**，只变化数据量——控制变量以验证"劣化比例随数据量变化"的趋势。若配置不同（节点数/shard 数/forcemerge/schema），则无法区分"数据量影响"和"配置影响"，趋势结论无效。
 
-| 项目 | 1M 测试（单节点） | 10M 测试（3 节点，详见 4.4） |
+| 项目 | 1M 测试 | 10M 测试 |
 |------|---------|---------|
-| 节点数 | 1 | 3（每节点 8C 16G，JVM heap 8GB） |
-| Shard 数 | 3 | 6 shard 1 replica |
+| 节点数 | **3**（每节点 8C 16G，JVM heap 8GB） | **3**（同左） |
+| Shard 数 | **6 shard 1 replica** | **6 shard 1 replica**（同左） |
 | 文档数 | 1,000,000 | 9,900,000 |
-| 字段数 | 10 | 13（含高基数 user_id=100K, session_id=500K） |
-| forcemerge | 是（隔离 segment 数变量） | 否（模拟生产） + 对照组 forcemerge |
+| 字段数 | **13（含高基数 user_id=100K, session_id=500K）** | **13（同左）** |
+| Schema | **相同**（字段定义、映射类型完全一致） | **相同** |
+| forcemerge | **否（模拟生产）+ 对照组 forcemerge** | **否（模拟生产）+ 对照组 forcemerge**（同左） |
 | 预热 | 50 轮（`-XX:+PrintCompilation` 沉默后开始计量） | 30-50 轮 |
 | 测试轮数 | ≥2000 轮（支撑 p99 置信区间） | ≥1000 轮 |
+| `maxResultWindow` | **显式记录**（默认 10000，影响 D 组深度分页路径） | **显式记录**（同左） |
+| `?preference` | `_primary`（消除 replica 路由差异） | `_primary`（同左） |
 
-> ⚠️ **单节点测试局限性**：无 scatter-gather、无跨节点网络延迟、无跨 shard merge。1M forcemerge 与 10M 未 forcemerge 的 segment 数差异巨大（1 段 vs 50-200 段），查询路径长度差 10-100 倍——**两组测试仅用于各自规模内的 SQL vs DSL 对比，不可外推到其他规模**。扩展性结论需引用 OpenSearch 官方基准交叉验证（见第六章）。
+> ✅ **可比性**：1M 和 10M 仅数据量不同，其他全部相同——可直接对比劣化比例变化，验证"小数据量劣化比例大、大数据量劣化比例小"的趋势。
+>
+> ⚠️ **1M 数据量注意事项**：1M / 6 shard ≈ 167K 文档/shard，每节点 ~334K 文档。延迟会很小（1-10ms），需要高精度计时（`time.perf_counter()`）+ ≥2000 轮样本支撑 p99 置信区间。
+>
+> ⚠️ **forcemerge 对照组**：1M 和 10M 都做 forcemerge 对照（隔离 segment 数变量）。forcemerge 组与未 forcemerge 组分别测试，4 组对比：1M-forced / 1M-unforced / 10M-forced / 10M-unforced。
+>
+> ⚠️ **仍不可外推到其他规模**：1M 和 10M 同配置可比，但 3 节点 6 shard 的结论不可外推到 30+ 节点（scatter-gather 长尾、协调节点 merge 开销非线性增长）。扩展性结论需引用 OpenSearch 官方基准交叉验证（见第六章）。
 
-### 4.2 轻查询场景（1M 数据，返回 ≤10 行）
+### 4.2 轻查询场景（1M + 10M 数据，返回 ≤10 行）
+
+> 以下场景在 1M 和 10M 数据上**都跑**（相同查询，表名 `perf_test` / `perf_test_10m`），直接对比劣化比例变化。配置见 4.1 节（统一配置）。
 
 > **对等性原则（关键）**：
 > - DSL 用 `bool.filter`（不打分），SQL V2 引擎 `WHERE AND` 也生成 `bool.filter`（`FilterQueryBuilder.java:109`）——**V2 路径对等**
@@ -343,9 +354,9 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 > T 组是验证核心结论的关键：**如果 T 组数据显示劣化比例随数据量增大而减小，则结论成立；否则结论不成立**。T 组与 G0 组交叉验证——G0 测纯翻译开销（应恒定），T 组测端到端劣化比例（应随数据量减小）。
 
-### 4.3 重查询场景（1M 数据，返回 5K-10K 行）
+### 4.3 重查询场景（1M + 10M 数据，返回 5K-10K 行）
 
-> 通过高命中率 + 大结果集 + 高基数聚合 + 深度翻页，让 DSL 执行时间达到 100-400ms。
+> 以下场景在 1M 和 10M 数据上**都跑**（相同查询，表名 `perf_test` / `perf_test_10m`），直接对比劣化比例变化。通过高命中率 + 大结果集 + 高基数聚合 + 深度翻页，让 DSL 执行时间达到 100-400ms（1M）/ 300-2000ms（10M）。
 
 #### A-H 组：大结果集点查
 
@@ -387,19 +398,18 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | E2-H JOIN 10K行 | `SELECT a.service, a.level, a.response_time_ms, b.dept_name FROM perf_test a JOIN perf_test_meta b ON a.host = b.host WHERE a.level = 'ERROR' LIMIT 10000` | Legacy V1 | 200-500ms |
 | E3-H IN子查询 10K行 | `SELECT service, level, response_time_ms FROM perf_test WHERE host IN (SELECT host FROM perf_test WHERE level = 'ERROR') LIMIT 10000` | Legacy V1 | 200-500ms |
 
-### 4.4 10M 多节点生产级验证方案
+### 4.4 10M 生产级验证方案
 
 > 目标：验证"大数据量重查询下 SQL 与 DSL 性能差异不大"。
+> **环境与 4.1 节统一配置完全一致**（3 节点 6 shard 1 replica 13 字段含高基数），此处仅补充生产级测试的额外控制项。4.2/4.3 节的场景在 1M 和 10M 上都跑（相同查询，表名 `perf_test` / `perf_test_10m`），直接对比劣化比例变化。
 
-#### 环境
+#### 额外控制项
 
 ```
-3 节点集群，每节点 8C 16G（JVM heap 8GB）
-6 shard 1 replica，10M 文档（13 字段含高基数）
-未 forcemerge（模拟生产） + 对照组 forcemerge（隔离 segment 数变量）
 slowlog threshold.query.warn: 0ms（仅 warn 级别，避免 info 级每查询同步写盘引入 1-5ms 抖动）
 所有查询加 ?preference=_primary（消除 replica 路由差异）
 测试窗口停止 indexing + translog durability=async + merge.scheduler.max_thread_count=1（隔离后台噪声）
+每轮之间 _cache/clear（见 4.6 节缓存控制，SQL 路径无法禁用 request cache）
 ```
 
 #### 场景组 G：生产典型重查询
@@ -516,7 +526,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 4. **Calcite 回退监控**：检查 "Fallback to V2" 日志（注意默认 `plugins.calcite.fallback.allowed=false`，仅 `CalciteUnsupportedException` 触发回退）
 5. **连接复用**：`requests.Session()` 消除 TCP 开销
 6. **@timestamp 标识符**：以 `@` 开头需反引号引用
-7. **segment 数控制**：1M forcemerge 与 10M 未 forcemerge 的 segment 数差异巨大，必须做 forcemerge 对照组隔离变量
+7. **segment 数控制**：1M 和 10M 统一配置（都不 forcemerge + 对照组 forcemerge），4 组对比隔离 segment 数变量（1M-forced / 1M-unforced / 10M-forced / 10M-unforced）
 8. **replica 路由**：所有查询加 `?preference=_primary` 消除 replica 路由差异（SQL 路径无 preference 参数，是结构性差异）
 9. **后台噪声隔离**：测试窗口停止 indexing + `translog.durability=async` + `merge.scheduler.max_thread_count=1`
 10. **circuit breaker 风险**：H 组高基数聚合前查 `indices.breaker.total.limit`（默认 70% parent + 40% fielddata）；500K 桶约需 200-400MB fielddata，预备 fallback 查询，记录 breaker 触发率
@@ -775,7 +785,7 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 **关键观察**：
 - Forcemerge 到单 segment 后，传统 concurrent search 无并行度（1 segment < 4 slices），intra-segment 才能继续切分
 - **8 clients 时无收益**：CPU 饱和，intra-segment 失去意义
-- 本测试 1M forcemerge 与 10M 未 forcemerge 的 segment 数差异巨大（1 段 vs 50-200 段），**结构性不可比**
+- 本测试 1M 和 10M 统一配置（都不 forcemerge + 对照组 forcemerge），segment 数差异仅来自数据量，可隔离对比
 
 ### 6.7 PPL 插件大规模性能 Gap（注意：PPL ≠ SQL）
 
@@ -872,7 +882,7 @@ ROI = (开发效率提升 × 开发人天单价) / (翻译开销 × 查询QPS ×
 **修正前（C+）的问题已解决**：
 - ✅ 4.1 vs 4.4 节点数矛盾已统一
 - ✅ slowlog 分解翻译开销方法已替换为 SQLService 内部埋点（方法 A）
-- ✅ 1M forcemerge vs 10M 未 forcemerge 已标注结构性不可比 + 补充对照组
+- ✅ 1M 和 10M 统一配置（相同 schema/shard/forcemerge），控制变量可对比劣化比例趋势
 - ✅ p99.9 在 200 样本下无统计意义——改为 ≥2000 轮或报 max
 - ✅ 线程池硬编码 8、静默回退措辞、composite size=1000 等代码事实已修正
 - ✅ 补充 PIT/async search/circuit breaker/并发资源隔离等生产关键场景
