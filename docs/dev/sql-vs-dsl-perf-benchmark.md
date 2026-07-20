@@ -212,7 +212,7 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | 3 表+ JOIN | `currently supports only 2 tables join`（`SqlParser.java:380`） | Legacy V1 限制 |
 | JOIN + GROUP BY | `JOIN queries do not support aggregations on the joined result.`（`Util.java:44`） | Legacy V1 限制 |
 | EXISTS 子查询 | 普通: `Unsupported subquery`（`SubQueryRewriter.java:74`）；嵌套字段: 实际支持（`NestedExistsRewriter.java`） | V2 抛 `getOnlyForCalciteException` 回退 Legacy；Legacy 仅支持嵌套字段 EXISTS |
-| 标量子查询 | V2: `Subsearch is supported only when plugins.calcite.enabled=true`（`ExpressionAnalyzer.java:470`）；Legacy: `unknown field name`（`FieldMaker.java:67`） | V2 引擎仅 Calcite 路径支持（SQL 仅 UNION 走 Calcite）；Legacy 受限于 Alibaba Druid SQL 解析器库 |
+| 标量子查询 | V2: `Subsearch is supported only when plugins.calcite.enabled=true`（`ExpressionAnalyzer.java:470`）；Legacy: `unknown field name`（`FieldMaker.java:67`） | V2 抛 `getOnlyForCalciteException`，仅 Calcite 引擎有实现（SQL 仅 UNION 走 Calcite，普通 SELECT 不走）；Legacy 遇到子查询作为字段直接抛异常（`FieldMaker.java:67`） |
 | COALESCE | V2: `unsupported function name: coalesce`（`BuiltinFunctionRepository.java:145`）；Legacy: `not supported in Schema`（`SelectResultSet.java:360`） | V2 函数注册表未注册 COALESCE（`BuiltinFunctionRepository.java:73-85`） |
 | DATE_HISTOGRAM | V2 无此函数；INTERVAL 参数处理有已知 bug | V2 core 无 DATE_HISTOGRAM 函数注册；`RexStandardizer.java:117` 注释 "INTERVAL_TYPES has bug, introduced by calcite-1.41.1"；Legacy 实际支持（`AggMaker.java:558-611`） |
 
