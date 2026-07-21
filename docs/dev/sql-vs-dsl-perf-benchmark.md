@@ -983,28 +983,12 @@ SQL 3913ms vs DSL 28ms（140 倍）。根因是 V2 引擎的 **composite 聚合�
 
 ### 5.8 测试局限性
 
-1. **样本量不足**：每场景 200 轮，p99 置信区间较宽。4.5 节建议 ≥2000 轮以支撑 p99 置信区间。200 轮的 p99 实际是第 198 个百分位点（200×0.99=198），统计意义有限
-2. **单物理机 3 节点无真实网络**：3 节点同机通过 127.0.0.1 通信，网络延迟 <0.1ms。生产环境跨节点网络 0.5-2ms，SQL 端到端开销中的"网络往返"部分被低估。对于需要 scatter-gather 的聚合查询（C1/C3），生产环境 SQL 开销可能更高
-3. **4GB heap 非生产 8GB**：本测试每节点 4GB heap（48GB 物理内存 / 3 节点 = 16GB/节点，留 12GB 给 OS + mmap）。生产推荐 8-16GB heap。heap 较小可能导致更频繁 GC，但测试期间未观察到 GC 停顿（heap.percent 22-33%）
-4. **无并发负载**：测试为单连接串行请求，无并发竞争。生产环境并发 SQL 查询可能触发 sql-worker 线程池排队（`thread_pool.sql-worker.queue_size=1000`），增加排队延迟
-5. **缓存偏差未完全消除**：
-   - A/B/D 组未每轮 `_cache/clear`，shard query cache 可能命中（尽管 LIMIT 10 的点查缓存命中率低）
-   - C1/C3 每 50 轮清缓存，但随机阈值 1-9000 在 200 轮中仍有 ~2% 重复概率
-   - SQL 路径无法禁用 request cache（`OpenSearchQueryRequest.search()` 不设 `requestCache`），C1/C3 的 size=0 聚合可能享受缓存——SQL 开销可能被低估
-6. **未forcemerge**：perf_test 有 39 个 segment（6 shard × ~6.5 segment/shard）。forcemerge 到 1 segment/shard 可提升查询性能 10-30%。生产环境通常 forcemerge 后查询，本测试保守
-7. **G0 测量方法局限**：
-   - 方法 A（`_explain`）走 legacy explain 路径，不经过 V2 `QueryService.executeWithLegacy()` 的完整 ANALYZE，可能低估
-   - 方法 B（PPL profile）走 Calcite 引擎，A/B/C/D 组走 V2 引擎，两者 Analyzer 实现不同。PPL ANALYZE 0.76ms 不能直接等同于 V2 ANALYZE——但交叉验证显示差异 <0.5ms
-   - 理想方案需在 `QueryService.java:147` 的 `ProfileMetric ANALYZE` 埋点暴露给 SQL REST API（当前仅 PPL 支持 `profile=true`）
-8. **JDK 25 非生产典型**：生产常见 JDK 17/21。JDK 25 的 `UseCompactObjectHeaders` + 向量 API (`jdk.incubator.vector`) 可能带来 5-15% 性能提升
-9. **数据量局限已部分解决**：5.2/5.3 节为 1M 文档 390MB（单分片 ~33MB），5.4 节补充 10M 文档 5GB（单分片 ~417MB）。10M 场景验证了大结果集劣化比例下降趋势，但 100M+ 场景仍需进一步验证
-10. **无 p999 和长尾分析**：200 轮样本无法可靠测量 p999。生产 SLO 通常关注 p99.9，需 ≥10000 轮样本
-11. **H1 场景耗时极长**：H1 单查询 ~4 秒，220 轮（含预热）耗时 ~15 分钟。生产环境高基数聚合可能触发查询超时（默认 30 秒）或 circuit breaker
-12. **G1/H2 缓存命中未消除**：G1 和 H2 为确定性查询（无随机阈值），request cache 命中后 SQL/DSL 均在 2ms 内返回。缓存场景下的开销占比（~50%）不代表真实冷查询性能。理想方案应每轮 `_cache/clear` 或添加随机阈值
-13. **C1-H → G3 对比不严格**：C1-H 使用随机阈值 1-9000（扫描 ~50% 文档），G3 使用时间过滤 `@timestamp > '2026-07-17'`（扫描 ~16% 文档），两者过滤条件不同，1M vs 10M 高基数聚合的对比仅作趋势参考
-14. **E 组无 DSL 对照**：UNION/JOIN/IN 子查询为 SQL 独有能力，无法测量"纯翻译开销"。E1b-H 的 139ms 包含 Calcite 引擎的流式拉取和合并开销，非单纯翻译
-15. **10M 索引段数较多**：10M 批量导入后约 60 个 segment（未 forcemerge），可能影响查询性能 10-30%。生产环境通常 forcemerge 后查询
-16. **heap 压力**：H1 测试期间 node-1 heap.percent 达 79%（4GB heap），接近 circuit breaker 阈值（90%）。更大数据量或更高基数聚合可能触发 OOM
+1. **统计方法**：每场景 200 轮，p99 实为第 198 百分位点（200×0.99），统计意义有限；无法测 p999（生产 SLO 常用，需 ≥10000 轮）。4.5 节建议 ≥2000 轮
+2. **环境与硬件**：① 单物理机回环，网络 <0.1ms（生产 0.5-2ms），聚合 scatter-gather 往返被低估；② 4GB heap 非生产 8GB，H1 期间达 79%（接近 90% breaker 阈值）；③ JDK 25 `UseCompactObjectHeaders` + 向量 API 可能比生产 JDK 17/21 快 5-15%
+3. **测试设计**：① 无并发负载（sql-worker 排队未测，生产 10-100 并发可能改变结论）；② 缓存偏差未完全消除——A/B/D 组未每轮 `_cache/clear`，G1/H2 为确定性查询缓存命中（开销占比 ~50% 不代表冷查询），SQL 路径无法禁用 request cache（C1/C3 size=0 聚合可能被低估）；③ 未 forcemerge（1M 39 段 / 10M 60 段，可能影响 10-30%）
+4. **测量方法**：G0 用 PPL/Calcite 路径 ANALYZE 推断 V2 翻译开销（跨引擎，见 §5.6.1）；C1-H→G3 过滤条件不同（见 §5.6.4）；E 组无 DSL 对照（见 §5.6.3）
+5. **数据覆盖**：1M + 10M 已验证大结果集劣化比例下降趋势，但 100M+ 及 30+ 节点需进一步验证（scatter-gather 长尾 + 协调节点 merge 非线性增长，不可外推）
+6. **生产风险**：H1 单查询 ~4s，生产环境可能触发超时（默认 30s）或 circuit breaker（见 §5.6.4 H1 分析）
 
 ---
 
