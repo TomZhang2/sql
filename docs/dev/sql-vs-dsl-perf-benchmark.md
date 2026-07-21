@@ -1116,6 +1116,14 @@ ROI = (开发效率提升 × 开发人天单价) / (翻译开销 × 查询QPS ×
 | G0-1 | 0.76 | — | 1.29 | — | 3.85 |
 | G0-2 | 0.84 | — | 0.98 | — | 4.18 |
 
+> ⚠️ **ANALYZE 与 OPTIMIZE 分离说明（重要）**：
+> - **ANALYZE 阶段**（`UnifiedQueryPlanner.java:63-73`）：解析 + AstBuilder + CalciteRelNodeVisitor 构建 RelNode + 后分析规则。**不含 Calcite Volcano 优化器**
+> - **OPTIMIZE 阶段**（`UnifiedQueryCompiler.compile()`）：Calcite Volcano 优化器，生成物理计划。**独立计时**
+> - G0 组报告的 0.76-0.84ms 是 **ANALYZE 阶段**，**不含 OPTIMIZE**
+> - 对于 V2 路径（A/B/C/D 组）：V2 无 Calcite 优化器，ANALYZE 即为完整翻译开销
+> - 对于 Calcite 路径（E 组 UNION）：完整翻译开销 = ANALYZE + OPTIMIZE，G0 仅测了一半
+> - PPL profile 中 OPTIMIZE 在轻查询中 <0.1ms（简单查询规则匹配快），但 2.3 节预期"Calcite 优化器 2-8ms"针对复杂查询——**简单查询的 OPTIMIZE 不能外推到复杂 UNION 查询**
+
 > PPL profile 中 OPTIMIZE/FORMAT 阶段在轻查询中耗时极低（<0.1ms），未单独列出。TOTAL 含网络往返 + JSON 序列化 + 线程调度，远大于 ANALYZE 本身。
 
 ### B.6 数据分析与结论
@@ -1123,6 +1131,8 @@ ROI = (开发效率提升 × 开发人天单价) / (翻译开销 × 查询QPS ×
 #### 1. 翻译开销是否在 2-18ms 范围内？
 
 **结论：实测纯翻译开销（ANALYZE 阶段）为 0.76-0.84ms，显著低于预期 2-18ms 区间。**
+
+> ⚠️ **范围说明**：G0 测量的是 ANALYZE 阶段（解析 + 构建 RelNode），**不含 Calcite Volcano 优化器**（OPTIMIZE 是独立阶段，见 B.5 节说明）。对于 V2 路径（A/B/C/D 组），V2 无 Calcite 优化器，ANALYZE 即为完整翻译开销。对于 Calcite 路径（E 组 UNION），完整翻译开销 = ANALYZE + OPTIMIZE，G0 仅测了 ANALYZE 部分——但 PPL profile 显示轻查询 OPTIMIZE <0.1ms，对 G0-1/G0-2 简单查询影响可忽略。复杂 UNION 查询的 OPTIMIZE 可能更高（2.3 节预期 2-8ms），G0-3 未实测。
 
 - G0-1 点查 ANALYZE p50 = 0.76ms（预期 2-7ms，**低于下界 63%**）
 - G0-2 聚合 ANALYZE p50 = 0.84ms（预期 3-10ms，**低于下界 72%**）
