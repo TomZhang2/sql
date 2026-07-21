@@ -15,6 +15,7 @@
 - [四、验证方案设计](#四验证方案设计)
 - [五、实测数据与测试报告](#五实测数据与测试报告)
 - [六、SQL 插件能力扩展评估](#六sql-插件能力扩展评估)
+- [七、社区维护情况](#七社区维护情况)
 
 ---
 
@@ -1125,6 +1126,165 @@ CTE ───────────── 独立（可用派生表替代）
 ### 6.5 关键洞察
 
 UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路由 → CalciteRelNodeVisitor 实现）仅适用于**计划级路由**的扩展（JOIN、EXISTS）。函数注册、聚合修复、表达式级子查询、语句级文法需要不同的扩展模式。
+
+---
+
+## 七、社区维护情况
+
+> 数据采集时间：2026-07-21 | 仓库：https://github.com/opensearch-project/sql
+
+### 7.1 GitHub 仓库统计
+
+| 指标 | 数值 |
+|------|------|
+| Stars | 174 |
+| Forks | 214 |
+| Contributors | 142 |
+| Open Issues | 258 |
+| Closed Issues | 1,798 |
+| Open PRs | 57 |
+| Merged PRs | 2,953（合并率 85.9%） |
+| 创建时间 | 2021-04-02 |
+| 最近 push | 2026-07-20 |
+| License | Apache-2.0 |
+
+**近 30 天活动**（2026-06-21 至 2026-07-21）：main 分支 23 commits、16 个新 issue、49 个新 PR、36 个合并 PR。
+
+**main 分支月度 commit 趋势**（过去 12 个月）：平均 ~42 commits/月，2025 年 9-10 月达峰值 85（3.0 正式版发布冲刺），2026 年初回落至 24-30，近期回升至 47-67。
+
+### 7.2 版本发布历史
+
+项目维护三条发布线，紧密跟随 OpenSearch 主版本节奏：
+
+| 发布线 | 最新版本 | 发布日期 | 节奏 |
+|--------|---------|----------|------|
+| **3.x 主线** | 3.7.0.0 | 2026-06-02 | 每 ~2 个月，严格对应 OpenSearch 3.x |
+| 2.19.x 维护线 | 2.19.6.0 | 2026-06-30 | 每 2-4 个月 |
+| 1.3.x LTS | 1.3.20.0 | 2024-12-06 | **已停止** |
+
+3.x 版本号与 OpenSearch 一一对应（3.0→3.7），发布间隔稳定在 ~2 个月，与 OpenSearch 核心同步发布。
+
+### 7.3 维护团队
+
+**17 名核心维护者**（来自 [MAINTAINERS.md](https://github.com/opensearch-project/sql/blob/main/MAINTAINERS.md)）：
+
+| 组织 | 人数 | 占比 |
+|------|:---:|:---:|
+| Amazon | 16 | 94% |
+| Improving | 1 | 6% |
+
+另有 16 名 Emeritus 维护者（已退出）。[CODEOWNERS](https://github.com/opensearch-project/sql/blob/main/.github/CODEOWNERS) 中列出全部 17 名维护者，所有路径均需维护者审查。
+
+过去 12 个月 top 10 提交者（main 分支）：
+
+| 提交者 | commits | 归属 |
+|--------|:---:|------|
+| Lantao Jin | 86 | Amazon（维护者） |
+| Kai Huang | 55 | Amazon（维护者） |
+| Heng Qian | 48 | Amazon（维护者） |
+| Simeon Widdis | 39 | Amazon（维护者） |
+| taozhang314 | 37 | Amazon（3.7 release） |
+| Tomoyuki Morita | 34 | Amazon（维护者） |
+| Chen Dai | 33 | Amazon（维护者） |
+| Yuanchun Shen | 29 | Amazon（维护者） |
+| Songkan Tang | 25 | Amazon（维护者） |
+| ritvibhatt | 17 | 社区贡献者 |
+
+**结论**：这是一个 **AWS 团队主导**的项目，top 10 提交者贡献了过去 12 个月 ~80% 的 commits，社区贡献为补充。
+
+### 7.4 活跃度指标
+
+**PR 合并时间**（最近 90 天，样本 100/186）：
+
+| 统计量 | 值 |
+|--------|:---:|
+| 中位数 | **0.85 天** |
+| 平均值 | 4.6 天 |
+| P90 | 12.0 天 |
+| 当日合并（<1 天） | **63%** |
+
+> 63% 当日合并率包含大量自动化 backport PR。功能型 PR 通常需 6-15 天。
+
+**Bug Issue 关闭时间**（最近 90 天，样本 19）：
+
+| 统计量 | 值 |
+|--------|:---:|
+| 中位数 | **60.3 天** |
+| 平均值 | 93.5 天 |
+| P90 | 222.6 天 |
+
+> Bug 修复周期较长（中位数 ~2 个月），反映 SQL/PPL 语义复杂度高的特点。
+
+**分诊与 stalled 情况**：
+
+| 指标 | 数值 | 说明 |
+|------|:---:|------|
+| Open untriaged issues | **3** | 占 258 个 open issues 的 **1.2%**（分诊率极高） |
+| Open stalled PRs | 7 | 占 57 个 open PR 的 12%（14 天无活动标记 stalled，不自动关闭） |
+| Open bugs | 54 | — |
+| Open enhancements | 126 | — |
+| Good first issues | 3 | 新人友好任务较少 |
+
+### 7.5 社区健康度
+
+**贡献规范**：完善（CONTRIBUTING.md + MAINTAINERS.md + CODEOWNERS + CODE_OF_CONDUCT.md + SECURITY.md + 5 个 Issue 模板）。DCO 签署必需，不接受匿名/化名。
+
+**CI/CD**：非常完善（**31 个 GitHub Actions workflow**），包括：
+
+| Workflow | 用途 |
+|----------|------|
+| `sql-test-and-build-workflow.yml` | 主 CI：编译 + 单元测试 |
+| `integ-tests-with-security.yml` | 安全模式集成测试 |
+| `sql-pitest.yml` | 变异测试（mutation testing） |
+| `backport.yml` | 自动 backport |
+| `codeql-analysis.yml` | GitHub CodeQL 安全扫描 |
+| `dco.yml` | DCO 签署检查 |
+| `add-untriaged.yml` | 新 issue 自动标记 untriaged |
+
+**代码覆盖率**：`build.gradle` 配置 JaCoCo 最低 50% 行覆盖率，`check` 任务依赖覆盖率验证（CI 强制）。集成 [Codecov](https://codecov.io/gh/opensearch-project/sql) 上报。
+
+### 7.6 已知技术债务
+
+**Legacy V1 引擎**（最大技术债）：
+
+| 指标 | 数值 |
+|------|------|
+| Legacy 模块 Java 文件数 | **307** |
+| 占全仓库 Java 文件比例 | **11.8%**（307/2607） |
+| 过去 12 个月 legacy/ commits | 21 |
+
+项目同时维护 V1（legacy）、V2、V3 三代引擎。近期 legacy 提交包括清理 deprecated API（`Remove all AccessController refs #4924`）、修复内存泄漏（`Fix PIT context leak #5009`）。团队正在积极清理，但 307 个文件仍构成显著维护负担。
+
+**其他债务**：
+- 258 个 open issues 积压（bug 中位数关闭 60 天）
+- 3.x 与 2.19.x 双线维护增加 backport 成本（`backport.yml` 自动化缓解）
+
+### 7.7 与同类项目对比
+
+| 仓库 | Stars | Forks | Open Issues | 最近 Push |
+|------|:---:|:---:|:---:|:---:|
+| k-NN | 220 | 223 | 273 | 2026-07-18 |
+| **SQL** | **174** | **214** | **258** | **2026-07-20** |
+| anomaly-detection | 93 | 84 | 109 | 2026-07-20 |
+| alerting | 81 | 131 | 344 | 2026-07-20 |
+| asynchronous-search | 34 | 58 | 33 | 2026-07-14 |
+
+SQL 插件 Stars 排名第 2（仅次于 k-NN），Forks 排名第 1（214），属最活跃梯队。Elasticsearch SQL 在 x-pack 商业插件中（闭源），无可比性。
+
+### 7.8 综合评估
+
+| 维度 | 评分 | 说明 |
+|------|:---:|------|
+| 社区规模 | ⭐⭐⭐⭐ | 174 stars / 142 contributors，生态第 2 |
+| 维护活跃度 | ⭐⭐⭐⭐⭐ | 每 2 月稳定发布，日均 1-2 PR 合并 |
+| 响应速度 | ⭐⭐⭐⭐ | PR 中位 0.85 天；bug 中位 60 天 |
+| 分诊质量 | ⭐⭐⭐⭐⭐ | 仅 3 个 untriaged（1.2%），极优秀 |
+| CI/CD 成熟度 | ⭐⭐⭐⭐⭐ | 31 个 workflow，覆盖率强制 50%，变异测试 |
+| 贡献门槛 | ⭐⭐⭐ | DCO 必需，维护者全 AWS，good-first-issue 仅 3 个 |
+| 技术债务 | ⭐⭐⭐ | Legacy 引擎占 11.8%；bug 修复慢 |
+| 版本治理 | ⭐⭐⭐⭐⭐ | 严格跟随 OpenSearch，3.x+2.19.x 双线清晰 |
+
+**结论**：OpenSearch SQL 是一个 **AWS 团队主导、高度活跃、工程规范成熟** 的核心插件。发布节奏稳定（每 2 月）、CI/CD 完善、分诊及时。主要风险在于 Legacy V1 引擎的持续维护负担和 bug 修复周期较长。社区贡献门槛较高（几乎全 AWS 维护者），外部贡献为补充。
 
 ---
 
