@@ -1,9 +1,9 @@
-# SQL vs DSL 查询性能对比验证方案
+# SQL vs DSL 性能差异的技术分析报告
 
 > 基于 OpenSearch 3.7.0 + SQL Plugin 3.7.0（含 UNION/UNION ALL 扩展）
 > 所有 SQL 能力声明均已通过实测验证
 
-> ⚠️ **范围声明**：本文档仅评估 SQL 插件的**性能维度**。选型决策还需独立评估安全性（SQL 注入、权限控制）、运维（升级兼容性、监控完备性）、生态兼容（JDBC/ODBC 驱动、BI 工具对接）等维度。
+> ⚠️ **范围声明**：本文档为 SQL vs DSL 性能差异的**技术分析报告**，聚焦性能维度的架构分析、实测数据与根因诊断。不涵盖：① 选型决策（需叠加安全性/SQL 注入、权限控制、运维/升级兼容性、生态兼容/JDBC-ODBC 驱动等维度）；② 并发负载与故障恢复测试（4.8 节 I 组已设计但未执行）；③ PPL `stats` 等替代方案的性能对比。**性能结论不等于选型决策。**
 
 ---
 
@@ -159,7 +159,7 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 ### 2.4 关键差异点
 
-1. **SQL 最终都翻译成 DSL**——差异只在上层翻译开销
+1. **SQL 最终都翻译成 DSL**——V2 和 Legacy V1 路径确实如此；但 **Calcite 路径不完全如此**：可下推部分（filter/agg/sort/limit）翻译为 DSL，不可下推部分通过 Enumerable 算子在协调节点内存计算（Janino codegen），不翻译为 DSL。差异在上层翻译开销 + 内存计算开销
 2. **Calcite 下推**——Convention trait 驱动，规则非代价；不可下推的操作在内存单线程计算
 3. **游标**——DSL `search_after`（无状态）vs V2 序列化游标（有状态）vs Calcite `EnumerableLimit`
 4. **无计划缓存**——每次查询重新解析+规划
@@ -341,6 +341,8 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | G0-4 JOIN | 同 E2 查询 | `_explain` 验证回退 Legacy V1（确认不经过 V2 ANALYZE）。Druid 解析耗时改用方法 B（slowlog 交叉验证）估算，精度 ±1ms，仅作量级参考 | 2-6ms（估算） |
 
 > G0 组数据用于：① 验证端到端延迟差 ≈ 翻译开销 + 序列化开销 + 网络/排队；② 作为"翻译开销本身可接受"的直接证据；③ 与 4.7 节预期矩阵的"SQL 额外开销"列交叉验证。
+>
+> ⚠️ **预期区间说明**：上述预期值（2-7ms / 3-10ms）基于保守硬件假设（单节点 + 1GB heap + JDK 17）估算。实际测试环境（3 节点 + M4 Pro + JDK 25）硬件性能显著更强，实测值 0.76-0.84ms 低于预期下界 62-72%。预期区间应理解为"生产典型环境的上界"，而非绝对基准。
 
 #### T 组：劣化比例趋势验证（控制变量）
 
@@ -852,7 +854,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 3. **A1 开销占比 56.2% 超出预期上界 47%**：根因是 DSL 基线过低（1.73ms），非 SQL 翻译变慢。若 DSL 在预期 3ms，同等 2.22ms 开销下占比仅 42.5%（在区间内）
 4. **聚合场景 p99 抖动明显**：C1 p99=10.03ms（p50=4.0ms，2.5× 抖动），C3 p99=8.63ms（p50=3.39ms，2.5× 抖动）。轻查询 A1-A3/B1/D1 抖动比仅 1.5-2×。V2 composite 聚合的分页拉取 + 随机阈值打散缓存导致更大尾延迟
 5. **D3 序列化开销主导**：D3 绝对开销 9.31ms 中 ~8.5ms 来自 1000 行序列化，纯翻译仅 ~0.8ms。这印证了 4.7 节"大结果集场景序列化开销占比高"的判断
-6. **无查询错误**：200 轮 × 8 场景 × 2 引擎 = 3200 次查询全部成功，SQL 插件稳定性良好
+6. **无查询错误**：200 轮 × 8 场景 × 2 引擎 = 3200 次查询全部成功，SQL 插件功能正确性良好（注：零错误证明功能正确性，不证明稳定性——稳定性需并发负载与故障恢复测试验证，见 4.8 节 I 组）
 7. **JDK 25 影响**：本测试使用 JDK 25（`-XX:+UseCompactObjectHeaders` 启用），紧凑对象头减少 heap 占用，可能间接提升 GC 和缓存效率。生产常见 JDK 17/21 可能稍慢
 8. **【10M】H1 极端异常**：SQL p50 = 3913ms vs DSL 28ms（140 倍），是本次测试最严重异常。根因是 SQL composite 聚合全量拉取 ~100K 桶后协调节点排序，DSL terms 聚合在分片层面排序。详见第 8 点分析
 9. **【10M】G1/H2 缓存命中导致数据失真**：G1（service×level 20桶）和 H2（service×level×region 80桶）为确定性查询（无随机阈值），预热后 request cache 命中，SQL/DSL 均在 2ms 内返回。缓存场景下开销占比 ~50% 主要来自 SQL REST 层固定开销（解析 + 序列化），**不代表真实冷查询性能**。这两个场景的数据不应参与"劣化比例"结论
@@ -874,7 +876,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 1. **序列化主导大结果集**：A1-H/B2-H/D2-H 返回 10K 行，SQL 开销 83-85ms，其中序列化占 ~80ms（每行 ~8μs）。与 5.2 节 D3（1000行 9ms）线性外推一致（10K行 × 8μs ≈ 80ms）
 2. **composite 聚合是高基数瓶颈**：C1-H 开销占比 83%（最高）。已通过 `_explain` 验证：SQL 走 V2 引擎，`GROUP BY user_id ORDER BY cnt DESC LIMIT 1000` 使用 composite 聚合（`AggregationQueryBuilder.java:97`，size=1000 硬编码），流式拉取全部 ~10K 桶后 `TakeOrderedOperator` 在协调节点排序；DSL 的 `terms` 聚合在分片层面排序合并，仅返回 Top N。**V2 无 composite→terms 转换机制**（`rePushDownSortAggMeasure` 仅 Calcite 路径调用）
 3. **深度分页开销最低**：D1-H 仅 28%，from=19990 的深翻页在 SQL 和 DSL 中都走 `from+size` 路径，SQL 额外开销仅 5.7ms（翻译 + from/size 参数转换）
-4. **C2-H 多级聚合意外快速**：80 桶的多级聚合 SQL 仅 2.5ms（vs C1-H 78ms），因桶数少（80 vs 1000）且 `ORDER BY level, cnt DESC` 触发了 terms 转换（方案 B），避免 composite 流式拉取
+4. **C2-H 多级聚合意外快速**：80 桶的多级聚合 SQL 仅 2.5ms（vs C1-H 78ms），因桶数少（80 < 1000），composite 单页拉取完毕，无分页开销。C1-H 有 ~10K 桶（user_id 基数），需 10 页拉取。差异来自**桶数**，非 terms 转换（V2 对 GROUP BY 永远用 composite，无 terms 转换，见 §4.2 验证）
 
 #### 7. E-H 组 SQL 独有场景性能（5.3.2 节）
 
@@ -913,8 +915,8 @@ def bench(name, fn_factory, warmup=50, runs=2000):
   3. `TakeOrderedOperator` 在协调节点内存中对 100K 桶排序取 Top 5000
   4. DSL 的 `terms` 聚合在每个分片层面排序取 Top 5000，协调节点仅合并 6 × 5000 = 30000 桶
 - **为什么 ORDER BY 没有触发 terms 转换**：`rePushDownSortAggMeasure`（`AggPushDownAction.java:133`）仅被 `AggSpec.java:192` → `CalciteLogicalIndexScan.java:343`（Calcite 路径）调用。`shouldUseCalcite()`（`QueryService.java:366-374`）对普通 SQL SELECT（无 UNION）返回 false，走 V2。V2 的 `OpenSearchIndexScan` 不调用 `rePushDownSortAggMeasure`
-- **影响**：任何 `GROUP BY <高基数字段>` + `ORDER BY <聚合字段>` + `LIMIT` 的 SQL 查询在高基数（>10K 桶）场景下都会出现此问题——这是 V2 引擎的**确定性架构限制**，非偶发 bug
-- **缓解方案**：① 使用 DSL terms 聚合；② 在 SQL 中添加 WHERE 条件降低基数；③ 使用 PPL `stats` 命令（走 Calcite pushdown，有 terms 转换）；④ 调低 `AggregationQueryBuilder.AGGREGATION_BUCKET_SIZE`（需改代码，非配置项）
+- **影响**：任何 `GROUP BY <高基数字段>` + `ORDER BY <聚合字段>` + `LIMIT` 的 SQL 查询在高基数（>10K 桶）场景下都会出现此问题——这是 V2 引擎的 **composite 聚合架构设计 + `AGGREGATION_BUCKET_SIZE=1000` 硬编码**共同导致的确定性限制，非偶发 bug。其中 composite（流式全量拉取）vs terms（分片 Top N）是架构选择；`AGGREGATION_BUCKET_SIZE=1000` 不可配置（需改代码）放大了分页轮次
+- **缓解方案**：① 使用 DSL terms 聚合；② 在 SQL 中添加 WHERE 条件降低基数；③ 使用 PPL `stats` 命令（走 Calcite pushdown，有 terms 转换）；④ 调高 `AggregationQueryBuilder.AGGREGATION_BUCKET_SIZE`（如改为 10000，需改代码，可减少分页轮次从 100 降至 10）；⑤ 调低 `AggregationQueryBuilder.AGGREGATION_BUCKET_SIZE`（需改代码，非配置项，但会减少单次拉取量）
 
 **G3 高基数聚合分析**：
 - SQL 74ms / DSL 9.2ms（8 倍）：与 1M C1-H（78ms / 13ms，6 倍）相比，SQL 时间相近但 DSL 更快（因 G3 有时间过滤，扫描文档更少）
@@ -960,15 +962,15 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 | 大数据量劣化比例小（序列化场景） | ✅ 成立 | A1-H 66% → H3 56%（↓9.7pp） | 序列化开销固定，DSL 随数据量增长 |
 | 大数据量劣化比例小（聚合场景） | ⚠️ 无法验证 | C1-H 83% → G3 88%（过滤条件不同，不可对比） | composite 开销与桶数相关，DSL terms 与文档数相关，理论应下降 |
 | H1 极端场景可接受 | ❌ 不成立 | 3913ms vs 28ms（140×） | 高基数聚合是 SQL 插件架构瓶颈 |
-| 无查询错误 | ✅ 成立 | 5800+ 次查询零错误 | 稳定性良好 |
+| 无查询错误 | ✅ 成立 | 5800+ 次查询零错误 | 功能正确性良好（稳定性需并发/故障恢复测试验证） |
 
 **核心结论**：
 
 1. **SQL 插件在点查/全文搜索/排序分页/大结果集场景下性能可接受**——劣化比例 34-66%，绝对开销 0.7-84ms（序列化主导），不影响用户体验
 2. **SQL 插件在低基数聚合场景（≤1K桶）下性能可接受**——劣化比例 51-83%，绝对开销 1.3-65ms
-3. **SQL 插件在高基数聚合场景（≥10K桶）下存在架构瓶颈**——composite 全量桶拉取 vs DSL terms 分片排序，H1（100K桶）劣化 140 倍，**不可接受**
+3. **SQL 插件在高基数聚合场景（≥50K桶）下存在架构瓶颈**——composite 全量桶拉取 vs DSL terms 分片排序，H1（100K桶）劣化 140 倍，**不可接受**。根因是 V2 composite 聚合架构设计（流式全量拉取）+ `AGGREGATION_BUCKET_SIZE=1000` 硬编码（非配置项）共同导致
 4. **"大数据量劣化比例小"假设仅在序列化主导场景成立**——聚合机制差异不随数据量缩小
-5. **选型建议**：SQL 插件适用于点查/全文/分页/低基数聚合场景；高基数聚合（GROUP BY 高基数字段 + LIMIT）应使用 DSL 或 PPL `stats`（走 Calcite pushdown）
+5. **技术结论**：SQL 插件适用于点查/全文/分页/低基数聚合场景；高基数聚合（GROUP BY 高基数字段 + LIMIT）应使用 DSL 或 PPL `stats`（走 Calcite pushdown）。**注：此结论基于单连接串行测试，并发负载与故障恢复未验证（见 4.8 节 I 组）；PPL `stats` 缓解方案未实测**
 
 ### 5.7 与预期值对比
 
@@ -998,7 +1000,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 - **DSL 延迟普遍低于预期 25-84%（轻查询）**：3 节点集群 + M4 Pro + SSD + JDK 25 的组合性能远超预期基线（预期基于单节点/低配硬件）。重查询场景 DSL 延迟在预期区间内，因数据扫描和排序耗时主导
 - **SQL 绝对开销低于预期（轻查询）**：8 个轻查询场景中 6 个低于预期下界，但 2 个（A1、D3）在预期区间内。重查询场景开销均在预期区间内（序列化开销与行数线性相关）
 - **开销占比基本在预期内**：18 个场景中 16 个在预期区间，A1 因 DSL 基线过低超上界，H1 因 composite 聚合机制远超上界
-- **G0 纯翻译开销低于预期 62-72%**：硬件性能 + JDK 25 优化使 ANTLR 解析和 Analyzer 极快
+- **G0 纯翻译开销低于预期 62-72%**：硬件性能 + JDK 25 优化使 ANTLR 解析和 Analyzer 极快。预期区间基于保守硬件假设，实测值反映强硬件性能（见 4.7 节 G0 预期区间说明）
 - **H1 是唯一远超预期的场景**：3885ms 开销远超预期上界 500ms，因 composite 聚合全量桶拉取的架构瓶颈
 
 ### 5.8 1M vs 10M 劣化比例详细对比
@@ -1041,7 +1043,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 - **序列化主导场景**（大结果集 10K 行）：SQL 开销 ~80ms 固定（与数据量无关），DSL 随数据量增长，**占比下降** ✅
 - **聚合机制差异场景**（高基数聚合）：SQL composite 全量拉取 vs DSL terms 分片排序，**差异不随数据量缩小** ❌
 - **缓存场景**（小聚合）：SQL/DSL 均命中缓存，**占比持平** ≈
-- **H1 极端场景**：500K 桶聚合在 10M 数据上 SQL 3913ms（140× DSL），**这是架构瓶颈非数据量问题**
+- **H1 极端场景**：500K 桶聚合在 10M 数据上 SQL 3913ms（140× DSL），**这是 composite 架构设计 + `AGGREGATION_BUCKET_SIZE=1000` 硬编码共同导致的瓶颈，非数据量问题**
 
 ### 5.9 测试局限性
 
