@@ -234,28 +234,35 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 ### 4.1 测试环境
 
-> **统一配置原则（关键）**：1M 和 10M 测试使用**相同 schema、相同集群配置、相同 forcemerge 策略**，只变化数据量——控制变量以验证"劣化比例随数据量变化"的趋势。若配置不同（节点数/shard 数/forcemerge/schema），则无法区分"数据量影响"和"配置影响"，趋势结论无效。
+> **统一配置原则（关键）**：1M 和 10M 测试使用**相同 schema、相同集群配置**，只变化数据量——控制变量以验证"劣化比例随数据量变化"的趋势。
 
-| 项目                | 1M 测试                                      | 10M 测试                          |
-| ----------------- | ------------------------------------------ | ------------------------------- |
-| 节点数               | **3**（每节点 8C 16G，JVM heap 8GB）             | **3**（同左）                       |
-| Shard 数           | **6 shard 1 replica**                      | **6 shard 1 replica**（同左）       |
-| 文档数               | 1,000,000                                  | 9,900,000                       |
-| 字段数               | **13（含高基数 user_id=100K, session_id=500K）** | **13（同左）**                      |
-| Schema            | **相同**（字段定义、映射类型完全一致）                      | **相同**                          |
-| forcemerge        | **否（模拟生产）+ 对照组 forcemerge**                | **否（模拟生产）+ 对照组 forcemerge**（同左） |
-| 预热                | 50 轮（`-XX:+PrintCompilation` 沉默后开始计量）      | 30-50 轮                         |
-| 测试轮数              | ≥2000 轮（支撑 p99 置信区间）                       | ≥1000 轮                         |
-| `maxResultWindow` | **显式记录**（默认 10000，影响 D 组深度分页路径）            | **显式记录**（同左）                    |
-| `?preference`     | `_primary`（消除 replica 路由差异）                | `_primary`（同左）                  |
+| 项目                  | 配置                                                                        |
+| ------------------- | ------------------------------------------------------------------------- |
+| 硬件                  | Apple M4 Pro, 14 CPU 核心, 48 GB RAM, SSD                                   |
+| 操作系统                | macOS Darwin 25.5.0 (ARM64)                                               |
+| JDK                 | Temurin 25.0.3+9-LTS                                                      |
+| OpenSearch 版本       | 3.7.0-SNAPSHOT                                                            |
+| 集群拓扑                | 3 节点（同物理机），全部为 data+cluster_manager 节点                                    |
+| 每节点 JVM heap        | 4 GB（`-Xms4g -Xmx4g`）                                                     |
+| 网络环境                | 127.0.0.1 回环（无真实网络延迟）                                                     |
+| Calcite 引擎          | `plugins.calcite.enabled=true`，`plugins.calcite.pushdown.enabled=true`    |
+| 测试索引（1M）            | `perf_test`：6 primary shard + 1 replica = 12 shard，1,000,000 文档，390 MB    |
+| 测试索引（10M）           | `perf_test_10m`：6 primary shard + 1 replica = 12 shard，10,000,000 文档，5 GB |
+| 字段数                 | 13（含高基数 user_id=100K, session_id=500K）                                    |
+| Schema              | 1M 和 10M 相同（字段定义、映射类型完全一致）                                                |
+| 段（segment）数         | 1M：39 个 / 10M：约 60 个（均未 forcemerge）                                       |
+| `max_result_window` | 20000（自定义）                                                                |
+| 预热                  | 20 轮                                                                      |
+| 测试轮数                | 200 轮                                                                     |
+| 缓存控制                | C1/C3 场景每 50 轮 `_cache/clear`；A/B/D 组无显式清缓存                               |
 
-> ✅ **可比性**：1M 和 10M 仅数据量不同，其他全部相同——可直接对比劣化比例变化，验证"小数据量劣化比例大、大数据量劣化比例小"的趋势。
+> ✅ **可比性**：1M 和 10M 仅数据量不同，其他全部相同——可直接对比劣化比例变化。
 > 
-> ⚠️ **1M 数据量注意事项**：1M / 6 shard ≈ 167K 文档/shard，每节点 ~334K 文档。延迟会很小（1-10ms），需要高精度计时（`time.perf_counter()`）+ ≥2000 轮样本支撑 p99 置信区间。
+> ⚠️ **测试轮数不足**：4.5 节原建议 ≥2000 轮支撑 p99 置信区间，实际执行 200 轮，p99 统计意义有限（见 §5.8 局限性 1）。
 > 
-> ⚠️ **forcemerge 对照组**：1M 和 10M 都做 forcemerge 对照（隔离 segment 数变量）。forcemerge 组与未 forcemerge 组分别测试，4 组对比：1M-forced / 1M-unforced / 10M-forced / 10M-unforced。
+> ⚠️ **forcemerge 对照组未执行**：原设计 4 组对比（1M-forced / 1M-unforced / 10M-forced / 10M-unforced），实际仅跑了 unforced 组。
 > 
-> ⚠️ **仍不可外推到其他规模**：1M 和 10M 同配置可比，但 3 节点 6 shard 的结论不可外推到 30+ 节点（scatter-gather 长尾、协调节点 merge 开销非线性增长）。
+> ⚠️ **仍不可外推到其他规模**：3 节点 6 shard 的结论不可外推到 30+ 节点（scatter-gather 长尾、协调节点 merge 开销非线性增长）。
 
 ### 4.2 轻查询场景（1M + 10M 数据，返回 ≤10 行）
 
