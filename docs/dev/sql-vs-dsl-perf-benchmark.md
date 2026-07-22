@@ -296,11 +296,11 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 #### D 组：排序与分页
 
-> ⚠️ **深度分页对等问题（关键）**：SQL `LIMIT offset, size` 在 `offset >= maxResultWindow`（默认 10000）时抛 `PushDownUnSupportedException`（`OpenSearchRequestBuilder.java:271`），回退到**内存分页**（拉取所有数据再跳过）——极慢，不公平。`from + size > maxResultWindow` 时切换到 **PIT + searchAfter**（`build()` line 135-140）——机制不同于 DSL from+size。
+> ⚠️ **深度分页对等问题（关键）**：SQL `LIMIT offset, size` 在 `offset >= maxResultWindow`（默认 10000）时抛 `PushDownUnSupportedException`（`OpenSearchRequestBuilder.java:271`），回退到**内存分页**（拉取所有数据再跳过）——极慢，不公平。`from + size > maxResultWindow` 时切换到 **PIT + searchAfter**（`buildRequestWithPit()` line 135-140）——机制不同于 DSL from+size。
 > **测试前必须**：① 明确记录 `maxResultWindow` 配置；② 用 `_explain` 验证 SQL 实际走哪条路径（内存分页 / PIT+searchAfter / from+size）。
 > D2 `LIMIT 10000, 10`：若 `maxResultWindow=10000`（默认），SQL 回退内存分页——**不参与性能对比**，仅作为"SQL 深度分页退化"的警示数据。
 
-> ⚠️ **D4 游标机制不对等**：SQL `fetch_size` 走 **PIT + searchAfter**（`OpenSearchRequestBuilder.build()` line 147-156 创建 PIT，`searchWithPIT` line 245-296 强制加 `_shard_doc` 排序，有状态）；DSL 走裸 `search_after`（无状态）。**这是不同机制的对比**（有状态 vs 无状态），不参与"SQL 翻译开销"结论，仅作为生产方案参考。
+> ⚠️ **D4 游标机制不对等**：SQL `fetch_size` 走 **PIT + searchAfter**（`OpenSearchRequestBuilder.buildRequestWithPit()` line 147-156 创建 PIT，`OpenSearchQueryRequest.searchWithPIT()` line 245-296 执行时强制加 `_doc` + `_shard_doc` 排序，有状态）；DSL 走裸 `search_after`（无状态）。**这是不同机制的对比**（有状态 vs 无状态），不参与"SQL 翻译开销"结论，仅作为生产方案参考。
 
 | 场景                     | SQL 查询                                                                         | DSL 查询                                                                                      | 引擎路径                |
 | ---------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |:-------------------:|
