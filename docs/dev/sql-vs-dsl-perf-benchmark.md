@@ -64,17 +64,17 @@ SQL → ANTLR 4 → AstBuilder → CalciteRelNodeVisitor → RelNode → OpenSea
 
 ### 1.4 三引擎对比
 
-| 维度    | Legacy V1 | V2                           | Calcite                    |
-| ----- | --------- | ---------------------------- | -------------------------- |
-| 解析器   | Druid     | ANTLR 4                      | ANTLR 4                    |
-| 计划抽象  | 无         | AST→LogicalPlan→PhysicalPlan | AST→RelNode                |
-| 优化器   | 无         | 简单规则                         | Calcite Volcano（无统计，退化为规则） |
-| 算子下推  | 无         | 无                            | ✅ filter/agg/sort/limit    |
-| JOIN  | ✅ 2 表     | ❌（回退 Legacy）                 | ✅ N 表（SQL 未路由到此）           |
-| UNION | ❌         | ❌（扩展后走 Calcite）              | ✅（我们的扩展）                   |
-| 窗口函数  | ❌         | ✅                            | ✅                          |
-| 内存计算  | 无         | 无                            | 有（Enumerable，单节点单线程）       |
-| 状态    | 维护中       | 活跃开发                         | 活跃开发（未来方向）                 |
+| 维度    | Legacy V1                | V2                             | Calcite                    |
+| ----- | ------------------------ | ------------------------------ | -------------------------- |
+| 解析器   | Druid                    | ANTLR 4                        | ANTLR 4                    |
+| 计划抽象  | 无                        | AST→LogicalPlan→PhysicalPlan   | AST→RelNode                |
+| 优化器   | 无                        | 简单规则                           | Calcite Volcano（无统计，退化为规则） |
+| 算子下推  | 无                        | 无                              | ✅ filter/agg/sort/limit    |
+| JOIN  | ✅ 2 表                    | ❌（回退 Legacy）                   | ✅ N 表（SQL 未路由到此）           |
+| UNION | ❌                        | ❌（扩展后走 Calcite）                | ✅（我们的扩展）                   |
+| 窗口函数  | ❌                        | ✅                              | ✅                          |
+| 内存计算  | 有（BlockHashJoin 等 V1 算子） | 有（TakeOrderedOperator 等 V2 算子） | 有（Enumerable，单节点单线程）       |
+| 状态    | 维护中                      | 活跃开发                           | 活跃开发（未来方向）                 |
 
 ### 1.5 路由逻辑
 
@@ -149,14 +149,14 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 ### 2.3 实现差异对比
 
-| 环节     | DSL                           | SQL (V2)                                             | SQL (Calcite)                | SQL (Legacy V1)                  |
-| ------ | ----------------------------- | ---------------------------------------------------- | ---------------------------- | -------------------------------- |
-| 请求解析   | JSON ~0.1ms                   | ANTLR ~0.5-2ms                                       | ANTLR ~0.5-2ms               | Druid ~1-3ms                     |
-| 语义分析   | 无                             | Analyzer ~0.5-2ms                                    | CalciteRelNodeVisitor ~1-5ms | 无                                |
-| 查询规划   | 无                             | Planner ~0.3-1ms                                     | Calcite Volcano 优化器 ~2-8ms   | 无                                |
-| DSL 生成 | 无（本身是 DSL）                    | PhysicalPlan→SearchRequestBuilder                    | Calcite 下推                   | QueryAction→SearchRequestBuilder |
-| 结果格式化  | `ToXContent` 原生输出（含在 DSL 基线中） | `JdbcResponseFormatter` JDBC 对象转换 + JSON 序列化，随行数线性增长 | 同 V2                         | `PrettyFormatRestExecutor`       |
-| 线程池    | search (8核→13线程)              | sql-worker (8核→8线程)                                  | sql-worker                   | sql-worker→search                |
+| 环节     | DSL                           | SQL (V2)                                             | SQL (Calcite)                | SQL (Legacy V1)                   |
+| ------ | ----------------------------- | ---------------------------------------------------- | ---------------------------- | --------------------------------- |
+| 请求解析   | JSON ~0.1ms                   | ANTLR ~0.5-2ms                                       | ANTLR ~0.5-2ms               | Druid ~1-3ms                      |
+| 语义分析   | 无                             | Analyzer ~0.5-2ms                                    | CalciteRelNodeVisitor ~1-5ms | 无                                 |
+| 查询规划   | 无                             | Planner ~0.3-1ms                                     | Calcite Volcano 优化器 ~2-8ms   | 无                                 |
+| DSL 生成 | 无（本身是 DSL）                    | PhysicalPlan→SearchRequestBuilder                    | Calcite 下推                   | 多次 DSL 请求 + 内存合并（如 BlockHashJoin） |
+| 结果格式化  | `ToXContent` 原生输出（含在 DSL 基线中） | `JdbcResponseFormatter` JDBC 对象转换 + JSON 序列化，随行数线性增长 | 同 V2                         | `PrettyFormatRestExecutor`        |
+| 线程池    | search (8核→13线程)              | sql-worker (8核→8线程)                                  | sql-worker                   | sql-worker→search                 |
 
 > **SQL 额外开销 = 翻译开销 + 结果格式化开销 + 线程调度开销**：
 > 
@@ -168,7 +168,7 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 **关键差异点**：
 
-1. **SQL 最终翻译为 DSL，但 Calcite 路径有例外**——V2 和 Legacy V1 完全翻译为 DSL；Calcite 路径可下推部分（filter/agg/sort/limit）翻译为 DSL，不可下推部分通过 Enumerable 算子在协调节点内存计算（Janino codegen），不走 DSL。因此 Calcite 路径额外开销 = 翻译 + 内存计算
+1. **SQL 支持 DSL 不具备的能力时，通过多次 DSL 请求 + 协调节点内存计算实现**——Legacy V1 的 JOIN 通过 `BlockHashJoin` 对两表各发一次 PIT 查询后内存 hash join；V2 的窗口函数/聚合排序通过 `TakeOrderedOperator` 在协调节点内存计算；Calcite 通过 Enumerable 算子（Janino codegen）内存计算。三者机制不同但本质相同：DSL 不支持的能力 = 多次 DSL + 内存合并
 2. **线程池隔离**——DSL 走 `search` 线程池，SQL 走 `sql-worker` 独立线程池。Legacy V1 路径从 sql-worker 穿透到 search 池。两池隔离意味着高并发 SQL 不直接挤占 DSL 线程，但 circuit breaker 是全局的（见 §4.8 I1）
 3. **游标机制不同**——DSL `search_after`（无状态）vs V2 序列化游标（有状态，PIT + searchAfter）vs Calcite `EnumerableLimit`。深翻页场景 SQL 可能回退内存分页（见 §4.2 D 组）
 4. **Calcite 内存风险**——UNION/JOIN 在协调节点单线程内存计算，大数据量可能 OOM。`executeWithCalcite` 会加 `LogicalSystemLimit`，但仍存在内存边界
