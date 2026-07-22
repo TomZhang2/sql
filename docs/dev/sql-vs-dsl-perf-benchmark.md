@@ -754,7 +754,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 
 **测试期间无 SQL/DSL 查询错误**（所有 200 轮均成功返回 200 状态码，H1 未触发 circuit breaker）。
 
-> ⚠️ **H1 极端异常**：SQL p50 = 3913ms，是 DSL（28ms）的 **140 倍**。根因是 SQL 路径使用 composite 聚合流式拉取全部 ~100K 个 `session_id` 桶再在协调节点排序取 Top 5000，而 DSL 的 `terms` 聚合在分片层面执行后合并，仅返回 5000 个桶。这是 SQL 插件在高基数聚合场景的已知架构瓶颈。详见 5.6 节第 6 点分析。
+> ⚠️ **H1 极端异常**：SQL p50 = 3913ms，是 DSL（28ms）的 **140 倍**。根因是 SQL 路径使用 composite 聚合流式拉取全部 ~100K 个 `session_id` 桶再在协调节点排序取 Top 5000，而 DSL 的 `terms` 聚合在分片层面执行后合并，仅返回 5000 个桶。这是 SQL 插件在高基数聚合场景的已知架构瓶颈。详见 §5.6.4 H1 分析。
 
 > 📝 **G1/H2 缓存命中说明**：G1（service×level 20桶）和 H2（service×level×region 80桶）均为确定性查询（无随机阈值），预热后 request cache 命中，SQL/DSL 均在 2ms 内返回。缓存场景下开销占比 ~50%，主要来自 SQL REST 层固定开销（解析 + 序列化），不代表真实冷查询性能。
 
@@ -770,7 +770,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 | G0-1 点查 | `SELECT * FROM perf_test WHERE status_code = 200 LIMIT 10`                                                 | 0.65                      | 1.04                      | 0.76                       | 1.11                       | 1.13                       | 2-7       |
 | G0-2 聚合 | `SELECT level, COUNT(*) FROM perf_test WHERE response_time_ms > 100 GROUP BY level ORDER BY COUNT(*) DESC` | 0.74                      | 1.01                      | 0.84                       | 1.10                       | 1.13                       | 3-10      |
 
-> ⚠️ **实测值低于预期区间**：G0-1 实测 0.76ms（预期 2-7ms），G0-2 实测 0.84ms（预期 3-10ms）。原因分析见 5.6 节第 1 点。
+> ⚠️ **实测值低于预期区间**：G0-1 实测 0.76ms（预期 2-7ms），G0-2 实测 0.84ms（预期 3-10ms）。原因分析见 §5.6.1。
 
 **PPL profile 完整阶段分解**（p50, ms）：
 
@@ -811,7 +811,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 - 轻查询差异 1.46-1.63ms：`JdbcResponseFormatter` 序列化 + sql-worker 线程调度 + HTTP 往返
 - D3 差异 ~8.47ms：序列化 1000 行 JSON 占 ~90%，与 4.7 节"序列化开销可达 10-50ms"预期一致
 - 网络：3 节点同机回环 <0.1ms，生产环境跨节点 0.5-2ms 差异会更大
-- **交叉验证**：G0-1 ANALYZE 0.76ms + 序列化/调度 ~1.46ms ≈ A1 端到端开销 2.22ms，数学闭合（注：此为间接推断——序列化/调度 1.46ms 由端到端减 ANALYZE 反推，非独立测量，见 §5.8 局限性 7）
+- **交叉验证**：G0-1 ANALYZE 0.76ms + 序列化/调度 ~1.46ms ≈ A1 端到端开销 2.22ms，数学闭合（注：此为间接推断——序列化/调度 1.46ms 由端到端减 ANALYZE 反推，非独立测量，见 §5.8 局限性 4）
 
 #### 2. 轻查询劣化分析（1M，5.2 节数据）
 
