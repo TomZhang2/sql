@@ -33,8 +33,8 @@ SQL → Druid Parser → QueryAction → SearchRequestBuilder → OpenSearch 执
 ```
 
 - **来源**：fork 自 `elasticsearch-sql`（NLPchina）
-- **支持**：2 表 JOIN、IN 子查询、UNION
-- **不支持**：3 表 JOIN、JOIN+GROUP BY、EXISTS、窗口函数、COALESCE、DATE_HISTOGRAM
+- **支持**：2 表 JOIN、IN 子查询
+- **不支持**：3 表 JOIN、JOIN+GROUP BY、EXISTS、UNION、窗口函数、COALESCE、DATE_HISTOGRAM
 - **状态**：维护中，不再新增功能
 
 ### 1.2 V2 引擎（当前主力）
@@ -71,7 +71,7 @@ SQL → ANTLR 4 → AstBuilder → CalciteRelNodeVisitor → RelNode → OpenSea
 | 优化器   | 无         | 简单规则                         | Calcite Volcano（无统计，退化为规则） |
 | 算子下推  | 无         | 无                            | ✅ filter/agg/sort/limit    |
 | JOIN  | ✅ 2 表     | ❌（回退 Legacy）                 | ✅ N 表（SQL 未路由到此）           |
-| UNION | ✅         | ❌（扩展后走 Calcite）              | ✅（我们的扩展）                   |
+| UNION | ❌         | ❌（扩展后走 Calcite）              | ✅（我们的扩展）                   |
 | 窗口函数  | ❌         | ✅                            | ✅                          |
 | 内存计算  | 无         | 无                            | 有（Enumerable，单节点单线程）       |
 | 状态    | 维护中       | 活跃开发                         | 活跃开发（未来方向）                 |
