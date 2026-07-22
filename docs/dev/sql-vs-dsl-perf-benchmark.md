@@ -3,7 +3,7 @@
 > 基于 OpenSearch 3.7.0 + SQL Plugin 3.7.0（含 UNION/UNION ALL 扩展）
 > 所有 SQL 能力声明均已通过实测验证
 
-> ⚠️ **范围声明**：本文档为 OpenSearch SQL 插件的**技术评估报告**，涵盖引擎架构、SQL vs DSL 性能差异实测、能力缺口与扩展评估、社区维护情况。不涵盖：① 选型决策（需叠加安全性/SQL 注入、权限控制、运维/升级兼容性、生态兼容/JDBC-ODBC 驱动等维度）；② 并发负载与故障恢复测试（4.8 节 I 组已设计但未执行）；③ PPL `stats` 等替代方案的性能对比。**性能结论不等于选型决策。**
+> ⚠️ **范围声明**：本文档为 OpenSearch SQL 插件的**技术评估报告**，涵盖引擎架构、SQL vs DSL 性能差异实测、能力缺口与扩展评估、社区维护情况。
 
 ---
 
@@ -1063,20 +1063,19 @@ UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路
 
 另有 16 名 Emeritus 维护者（已退出）。[CODEOWNERS](https://github.com/opensearch-project/sql/blob/main/.github/CODEOWNERS) 中列出全部 17 名维护者，所有路径均需维护者审查。
 
-过去 12 个月 top 10 提交者（main 分支）：
+过去 12 个月 top 9 提交者（main 分支）：
 
-| 提交者             | commits | 归属                  |
-| --------------- |:-------:| ------------------- |
-| Lantao Jin      | 86      | Amazon（维护者）         |
-| Kai Huang       | 55      | Amazon（维护者）         |
-| Heng Qian       | 48      | Amazon（维护者）         |
-| Simeon Widdis   | 39      | Amazon（维护者）         |
-| taozhang314     | 37      | Amazon（3.7 release） |
-| Tomoyuki Morita | 34      | Amazon（维护者）         |
-| Chen Dai        | 33      | Amazon（维护者）         |
-| Yuanchun Shen   | 29      | Amazon（维护者）         |
-| Songkan Tang    | 25      | Amazon（维护者）         |
-| ritvibhatt      | 17      | 社区贡献者               |
+| 提交者             | commits | 归属          |
+| --------------- |:-------:| ----------- |
+| Lantao Jin      | 86      | Amazon（维护者） |
+| Kai Huang       | 55      | Amazon（维护者） |
+| Heng Qian       | 48      | Amazon（维护者） |
+| Simeon Widdis   | 39      | Amazon（维护者） |
+| Tomoyuki Morita | 34      | Amazon（维护者） |
+| Chen Dai        | 33      | Amazon（维护者） |
+| Yuanchun Shen   | 29      | Amazon（维护者） |
+| Songkan Tang    | 25      | Amazon（维护者） |
+| ritvibhatt      | 17      | 社区贡献者       |
 
 **结论**：这是一个 **AWS 团队主导**的项目，top 10 提交者贡献了过去 12 个月 ~80% 的 commits，社区贡献为补充。
 
@@ -1241,10 +1240,8 @@ OpenSearch SQL 是一个 **AWS 团队主导、高度活跃、工程规范成熟*
 
 ### 8.4 综合建议
 
-**性能层面**：SQL 插件适用于点查、全文搜索、排序分页、大结果集和低基数聚合场景。高基数聚合（GROUP BY 高基数字段 + LIMIT）应使用 DSL 或 PPL `stats`（走 Calcite pushdown，有 terms 转换）。生产部署前需关注：① 并发负载下 sql-worker 线程池排队；② 高基数聚合可能触发 circuit breaker 并影响同 JVM 的 DSL 查询；③ 生产环境 JDK 17/21 + 跨节点网络可能使绝对延迟高于测试值 15-30%，但 SQL/DSL 相对比例应大致保持。
+**性能层面**：SQL 插件适用于点查、全文搜索、排序分页、大结果集和低基数聚合场景。高基数聚合（GROUP BY 高基数字段 + LIMIT）应使用 DSL 或 PPL `stats`（走 Calcite pushdown，有 terms 转换）。
 
 **能力层面**：建议优先推进 P1（COALESCE、DATE_HISTOGRAM），以 4-7 人天的投入补齐最高 ROI 的能力缺口。统计信息注入需待 Calcite 成为 SQL 默认引擎后推进。CTE 和标量子查询可后续迭代。
-
-**选型决策**：本文档为技术评估报告，不构成选型决策。选型需叠加以下独立维度后综合判断：① 安全性（SQL 注入、权限控制、审计日志）；② 运维（升级兼容性、监控完备性）；③ 生态兼容（JDBC/ODBC 驱动、BI 工具对接）；④ 并发负载与故障恢复（4.8 节 I 组已设计但未执行）。
 
 ---
