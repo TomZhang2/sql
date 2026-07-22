@@ -349,25 +349,6 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 > 
 > ⚠️ **预期区间说明**：上述预期值（2-7ms / 3-10ms）基于保守硬件假设（单节点 + 1GB heap + JDK 17）估算。实际测试环境（3 节点 + M4 Pro + JDK 25）硬件性能显著更强，实测值 0.82-4.36ms 低于预期下界。预期区间应理解为"生产典型环境的上界"，而非绝对基准。
 
-#### T 组：劣化比例趋势验证（控制变量）
-
-> **目的**：在同一集群、同一 schema、同一配置下，用相同查询控制命中数据量，验证"小数据量劣化比例大、大数据量劣化比例小"的趋势。
-> **方法**：在 10M 集群上，通过 `WHERE` 条件控制命中行数（1K / 100K / 1M / 10M），用相同 SQL 和 DSL 查询跑 ≥1000 轮，观察劣化比例变化。
-> 
-> ⚠️ **缓存控制**：T 组每个子场景用**随机阈值微调**（如 T1-1K 用 `response_time_ms > 9900 ± 50`），打散缓存同时保持命中行数 ≈1K。
-> ⚠️ **缓存命中率监控**：每轮记录 SQL/DSL 侧 `indices/query_cache/hit_count`，若 SQL 侧命中率显著高于 DSL 侧，标注「缓存偏差」。
-
-| 场景          | 命中行数    | SQL 查询                                                                                                             | DSL 查询                                                                                                             | 预期趋势            | 预期劣化比例 |
-| ----------- |:-------:| ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | --------------- |:------:|
-| T1-1K       | ~1K     | `SELECT * FROM perf_test_10m WHERE status_code = 200 AND response_time_ms > 9900 LIMIT 10`                         | `{"query":{"bool":{"filter":[{"term":{"status_code":200}},{"range":{"response_time_ms":{"gt":9900}}}]},"size":10}` | 劣化比例最大（翻译开销占比高） | 50-80% |
-| T1-100K     | ~100K   | `SELECT * FROM perf_test_10m WHERE status_code = 200 AND response_time_ms > 5000 LIMIT 10`                         | 同结构，阈值 5000                                                                                                        | 劣化比例中           | 20-40% |
-| T1-1M       | ~1M     | `SELECT * FROM perf_test_10m WHERE status_code = 200 LIMIT 10`                                                     | `{"query":{"term":{"status_code":200}},"size":10}`                                                                 | 劣化比例小           | 5-15%  |
-| T1-10M      | ~10M    | `SELECT * FROM perf_test_10m LIMIT 10`                                                                             | `{"query":{"match_all":{}},"size":10}`                                                                             | 劣化比例最小（DSL 主导）  | 1-5%   |
-| T2-聚合-1K桶   | ~1K 桶   | `SELECT service, COUNT(*) FROM perf_test_10m WHERE response_time_ms > 100 GROUP BY service ORDER BY COUNT(*) DESC` | terms agg size=1000                                                                                                | 劣化比例随桶数变化       | —      |
-| T2-聚合-100K桶 | ~100K 桶 | `SELECT user_id, COUNT(*) FROM perf_test_10m WHERE response_time_ms > 100 GROUP BY user_id ORDER BY COUNT(*) DESC` | terms agg size=1000                                                                                                | 劣化比例小（DSL 耗时大）  | —      |
-
-> T 组是验证核心结论的关键：**如果 T 组数据显示劣化比例随数据量增大而减小，则结论成立；否则结论不成立**。T 组与 G0 组交叉验证——G0 测纯翻译开销（应恒定），T 组测端到端劣化比例（应随数据量减小）。
-
 ### 4.3 重查询场景（1M + 10M 数据，返回 5K-10K 行）
 
 > 以下场景在 1M 和 10M 数据上**都跑**（相同查询，表名 `perf_test` / `perf_test_10m`），直接对比劣化比例变化。通过高命中率 + 大结果集 + 高基数聚合 + 深度翻页，让 DSL 执行时间达到 100-400ms（1M）/ 300-2000ms（10M）。
@@ -564,7 +545,6 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 | G0 纯翻译开销              | —                | 0.82-4.36（`_explain` 端点实测）       | —            | —                                                | `_explain` 走 V2 完整路径（ANTLR+AstBuilder+Analyzer+Planner），仅跳过执行（见 5.5 节代码验证）；G0-1/G0-2 走 V2 路径，G0-3 走 Calcite 路径含 Volcano 优化器 |
 | G1 10M 聚合             | 300-600          | 5-15 (稳态) / 30-80 (冷启动含 codegen) | 1-5% / 5-13% | —                                                | 区分冷启动 vs 稳态                                                                                                                 |
 | H1 10M 高基数聚合          | 800-2000 (或 OOM) | 10-30                            | 0.5-3%       | —                                                | 500K 桶 10M 数据可能触发 breaker；1M 数据无 OOM 风险，预期 DSL 200-500ms                                                                    |
-| T 组趋势                 | 见 T 组表           | 见 T 组表                           | 随数据量减小       | —                                                | 验证"小数据劣化大、大数据劣化小"核心结论。⚠️ 缓存偏差方向：SQL 侧受益更多，劣化比例可能被低估 5-15%                                                                   |
 
 ### 4.8 生产关键场景补充
 
@@ -605,7 +585,6 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 | D 组（排序分页）     | 行数 + 值集合 + 顺序完全一致（含 `ORDER BY`）                                                                           | 是               | D2 深度分页 SQL 可能回退内存分页（结果等价但路径不同）；D4 游标机制不同（PIT vs 裸 search_after）                                                                                                                                                    | ⚠️ D2 仅 maxResultWindow 调大时参与；D4 **仅性能对比，不参与正确性结论** |
 | E 组（SQL 独有）   | DSL 无严格等价物（多次查询+应用层合并）                                                                                    | —               | E1 UNION 合并顺序、E2/E3 JOIN 语义不等价                                                                                                                                                                                      | ❌ **仅性能对比，不参与正确性结论**                                |
 | G0 组（纯翻译基线）   | 不涉及（仅测翻译阶段耗时）                                                                                             | —               | —                                                                                                                                                                                                                   | ❌ 不参与                                               |
-| T 组（趋势验证）     | 同 A 组判据（点查子集）                                                                                             | 否               | 无                                                                                                                                                                                                                   | ✅ 参与                                                |
 | G/H 组（重查询）    | 按子组分类：A-H 同 A 组（点查）；B-H 同 B 组（全文搜索）；C-H/G3/H1 同 C 组判据；D-H 同 D 组（排序分页）；E-H 同 E 组（SQL 独有）                   | 视场景             | C1-H/G3/H1：SQL composite 全量桶精确排序 vs DSL terms 分片 top N 合并，底部排名可能因 `doc_count_error` 有微小差异——**容差内则参与，否则标注**。C2-H：DSL 用 nested terms（非 composite，与 C2 轻查询的 composite 对等不同），桶数少（80）时结果等价。H1 500K 桶可能触发 breaker 导致结果不完整 | ⚠️ 聚合场景需确认 breaker 未触发 + 容差通过后才参与；E-H 同 E 组不参与      |
 | I 组（失败恢复）     | 不涉及（仅测资源隔离/恢复）                                                                                            | —               | —                                                                                                                                                                                                                   | ❌ 不参与                                               |
 | D5 组（深翻页生产方案） | SQL 游标 vs DSL PIT/search_after 各自完整性校验（行数总和 = 总匹配数）                                                       | —               | 机制不同，无交叉等价                                                                                                                                                                                                          | ❌ **仅性能对比，不参与正确性结论**                                |
