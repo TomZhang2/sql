@@ -104,10 +104,11 @@ Legacy V1（淘汰中）→ V2（当前主力）→ Calcite（未来方向）
 ### 2.1 DSL 查询路径
 
 ```
-POST /index/_search → RestSearchAction → TransportSearchAction → QueryPhase → FetchPhase → JSON
+POST /index/_search → RestSearchAction → TransportSearchAction → QueryPhase → FetchPhase → ToXContent → JSON
 ```
 
-- 零翻译层、零中间对象、零额外内存
+- 无翻译层、无中间对象转换
+- 结果序列化：OpenSearch 原生 `ToXContent` 直接输出 JSON，无 JDBC 格式转换
 - 执行线程：`search` 线程池（8 核→13 线程）
 
 ### 2.2 SQL 查询路径
@@ -148,15 +149,17 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 ### 2.3 实现差异对比
 
-| 环节     | DSL                     | SQL (V2)                                  | SQL (Calcite)                     | SQL (Legacy V1)                  |
-| ------ | ----------------------- | ----------------------------------------- | --------------------------------- | -------------------------------- |
-| 请求解析   | JSON ~0.1ms             | ANTLR ~0.5-2ms                            | ANTLR ~0.5-2ms                    | Druid ~1-3ms                     |
-| 语义分析   | 无                       | Analyzer ~0.5-2ms                         | CalciteRelNodeVisitor ~1-5ms      | 无                                |
-| 查询规划   | 无                       | Planner ~0.3-1ms                          | Calcite 优化器 ~2-8ms                | 无                                |
-| DSL 生成 | 无（本身是 DSL）              | PhysicalPlan→SearchRequestBuilder         | Calcite 下推                        | QueryAction→SearchRequestBuilder |
-| 结果格式化  | JSON ~0.5ms             | JdbcResponseFormatter ~1-2ms              | JdbcResponseFormatter ~1-2ms      | PrettyFormatRestExecutor ~1-2ms  |
-| 线程池    | search (OS 内置, 8核→13线程) | sql-worker (=allocatedProcessors, 8核→8线程) | sql-worker (=allocatedProcessors) | sql-worker→search                |
-| 总额外开销  | ~0ms                    | ~2-7ms                                    | ~5-18ms                           | ~2-6ms                           |
+| 环节     | DSL                      | SQL (V2)                                     | SQL (Calcite)                     | SQL (Legacy V1)                   |
+| ------ | ------------------------ | -------------------------------------------- | --------------------------------- | --------------------------------- |
+| 请求解析   | JSON ~0.1ms              | ANTLR ~0.5-2ms                               | ANTLR ~0.5-2ms                    | Druid ~1-3ms                      |
+| 语义分析   | 无                        | Analyzer ~0.5-2ms                            | CalciteRelNodeVisitor ~1-5ms      | 无                                 |
+| 查询规划   | 无                        | Planner ~0.3-1ms                             | Calcite 优化器 ~2-8ms                | 无                                 |
+| DSL 生成 | 无（本身是 DSL）               | PhysicalPlan→SearchRequestBuilder            | Calcite 下推                        | QueryAction→SearchRequestBuilder  |
+| 结果格式化  | `ToXContent` 原生输出 ~0.5ms | `JdbcResponseFormatter`（多一层 JDBC 对象转换）~1-2ms | `JdbcResponseFormatter` ~1-2ms    | `PrettyFormatRestExecutor` ~1-2ms |
+| 线程池    | search (OS 内置, 8核→13线程)  | sql-worker (=allocatedProcessors, 8核→8线程)    | sql-worker (=allocatedProcessors) | sql-worker→search                 |
+| 总额外开销  | ~0ms                     | ~2-7ms                                       | ~5-18ms                           | ~2-6ms                            |
+
+> **SQL 额外开销来源**：① ANTLR/Druid 解析 + 语义分析 + 查询规划（翻译开销）；② `JdbcResponseFormatter` 把 OpenSearch `SearchResponse` 转为 JDBC `List<Object[]>` 再序列化 JSON（比 DSL 原生 `ToXContent` 多一层对象转换）；③ sql-worker 线程调度（独立线程池，非 search 池）。DSL 的 `ToXContent` 序列化开销已包含在 DSL 基线延迟中，不计入"额外开销"。
 
 ### 2.4 关键差异点
 
@@ -174,28 +177,28 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 ### 3.1 查询能力矩阵
 
-| 能力              | SQL | DSL | 说明                                                                                                                                                                           |
-| --------------- |:---:|:---:| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 等值/范围查询         | ✅   | ✅   | SQL `WHERE`; DSL `term`/`range`                                                                                                                                              |
-| 多条件布尔查询         | ✅   | ✅   | SQL `AND`/`OR`; DSL `bool`                                                                                                                                                   |
-| 全文搜索            | ✅   | ✅   | SQL `match()`/`multi_match()`/`match_phrase()`，支持 boost/fuzziness/analyzer/minimum_should_match 参数；不支持 `query_string`/`simple_query_string`/`operator`（`AND` 为 SQL 关键字冲突） |
-| GROUP BY 聚合     | ✅   | ✅   | SQL `GROUP BY`; DSL `aggs`                                                                                                                                                   |
-| 窗口函数            | ✅   | ❌   | SQL `RANK() OVER(...)`; DSL 不支持                                                                                                                                              |
-| 2 表 JOIN        | ✅   | ❌   | SQL（回退 Legacy V1）; DSL 不支持                                                                                                                                                   |
-| 3 表+ JOIN       | ❌   | ❌   | SQL 报错 "only 2 tables"                                                                                                                                                       |
-| JOIN + GROUP BY | ❌   | ❌   | SQL 报错 "JOIN queries do not support aggregations on the joined result."（`Util.java:44`）                                                                                      |
-| UNION ALL       | ✅   | ❌   | SQL（我们的扩展，走 Calcite）                                                                                                                                                         |
-| UNION DISTINCT  | ✅   | ❌   | SQL（我们的扩展，走 Calcite）                                                                                                                                                         |
-| IN 子查询          | ✅   | ❌   | SQL（回退 Legacy V1 IN→JOIN 重写）                                                                                                                                                 |
-| EXISTS 子查询      | ❌   | ❌   | 普通 EXISTS 和嵌套字段 EXISTS 均报错 "Unsupported subquery"（`SubQueryRewriter.java:74`）。代码中 `NestedExistsRewriter.java` 存在但无法到达（已被 `SubQueryRewriter` 拦截） |
-| 标量子查询           | ❌   | ❌   | V2 报 `Subsearch is supported only when plugins.calcite.enabled=true`（`ExpressionAnalyzer.java:470`）；Calcite 引擎有实现但 SQL 默认不路由到此。实测验证：标量子查询报 "unsupported expr"（Legacy V1 Druid 解析失败）                                            |
-| 派生表             | ✅   | ❌   | SQL `(SELECT...) AS t`                                                                                                                                                       |
-| CTE (WITH)      | ❌   | ❌   | 文法无 WITH 规则（`OpenSearchSQLLexer.g4` 无 WITH token）；Legacy 报错 "Query must start with SELECT, DELETE, SHOW or DESCRIBE"（`OpenSearchActionFactory.java:135`），V2 抛 ANTLR 语法错误     |
-| COALESCE        | ❌   | ✅   | V2 引擎报错 "unsupported function name: coalesce"（`BuiltinFunctionRepository.java:145`，函数注册表缺失）；Legacy 报错 "not supported in Schema"（`SelectResultSet.java:360`）                  |
-| DATE_HISTOGRAM  | ❌   | ✅   | V2 引擎无 DATE_HISTOGRAM 函数注册；Legacy 实际支持（`AggMaker.java:558-611`，含 interval/fixed_interval/format/time_zone 等参数）；V2 INTERVAL 参数处理有已知 bug（`RexStandardizer.java:117` 注释），基于实测观察 |
-| 脚本字段            | ❌   | ✅   | DSL `script_fields`                                                                                                                                                          |
-| 运行时字段           | ❌   | ✅   | DSL `runtime_mappings`                                                                                                                                                       |
-| profile API     | ❌   | ✅   | DSL `profile: true`                                                                                                                                                          |
+| 能力              | SQL | DSL | 说明                                                                                                                                                                                  |
+| --------------- |:---:|:---:| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 等值/范围查询         | ✅   | ✅   | SQL `WHERE`; DSL `term`/`range`                                                                                                                                                     |
+| 多条件布尔查询         | ✅   | ✅   | SQL `AND`/`OR`; DSL `bool`                                                                                                                                                          |
+| 全文搜索            | ✅   | ✅   | SQL `match()`/`multi_match()`/`match_phrase()`，支持 boost/fuzziness/analyzer/minimum_should_match 参数；不支持 `query_string`/`simple_query_string`/`operator`（`AND` 为 SQL 关键字冲突）           |
+| GROUP BY 聚合     | ✅   | ✅   | SQL `GROUP BY`; DSL `aggs`                                                                                                                                                          |
+| 窗口函数            | ✅   | ❌   | SQL `RANK() OVER(...)`; DSL 不支持                                                                                                                                                     |
+| 2 表 JOIN        | ✅   | ❌   | SQL（回退 Legacy V1）; DSL 不支持                                                                                                                                                          |
+| 3 表+ JOIN       | ❌   | ❌   | SQL 报错 "only 2 tables"                                                                                                                                                              |
+| JOIN + GROUP BY | ❌   | ❌   | SQL 报错 "JOIN queries do not support aggregations on the joined result."（`Util.java:44`）                                                                                             |
+| UNION ALL       | ✅   | ❌   | SQL（我们的扩展，走 Calcite）                                                                                                                                                                |
+| UNION DISTINCT  | ✅   | ❌   | SQL（我们的扩展，走 Calcite）                                                                                                                                                                |
+| IN 子查询          | ✅   | ❌   | SQL（回退 Legacy V1 IN→JOIN 重写）                                                                                                                                                        |
+| EXISTS 子查询      | ❌   | ❌   | 普通 EXISTS 和嵌套字段 EXISTS 均报错 "Unsupported subquery"（`SubQueryRewriter.java:74`）。代码中 `NestedExistsRewriter.java` 存在但无法到达（已被 `SubQueryRewriter` 拦截）                                     |
+| 标量子查询           | ❌   | ❌   | V2 报 `Subsearch is supported only when plugins.calcite.enabled=true`（`ExpressionAnalyzer.java:470`）；Calcite 引擎有实现但 SQL 默认不路由到此。实测验证：标量子查询报 "unsupported expr"（Legacy V1 Druid 解析失败） |
+| 派生表             | ✅   | ❌   | SQL `(SELECT...) AS t`                                                                                                                                                              |
+| CTE (WITH)      | ❌   | ❌   | 文法无 WITH 规则（`OpenSearchSQLLexer.g4` 无 WITH token）；Legacy 报错 "Query must start with SELECT, DELETE, SHOW or DESCRIBE"（`OpenSearchActionFactory.java:135`），V2 抛 ANTLR 语法错误            |
+| COALESCE        | ❌   | ✅   | V2 引擎报错 "unsupported function name: coalesce"（`BuiltinFunctionRepository.java:145`，函数注册表缺失）；Legacy 报错 "not supported in Schema"（`SelectResultSet.java:360`）                         |
+| DATE_HISTOGRAM  | ❌   | ✅   | V2 引擎无 DATE_HISTOGRAM 函数注册；Legacy 实际支持（`AggMaker.java:558-611`，含 interval/fixed_interval/format/time_zone 等参数）；V2 INTERVAL 参数处理有已知 bug（`RexStandardizer.java:117` 注释），基于实测观察        |
+| 脚本字段            | ❌   | ✅   | DSL `script_fields`                                                                                                                                                                 |
+| 运行时字段           | ❌   | ✅   | DSL `runtime_mappings`                                                                                                                                                              |
+| profile API     | ❌   | ✅   | DSL `profile: true`                                                                                                                                                                 |
 
 ### 3.2 SQL 独有能力
 
@@ -209,15 +212,15 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 ### 3.3 SQL 已知限制
 
-| 限制              | 错误信息                                                                                                                                                  | 根因                                                                                                                                                      |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| CTE             | Legacy: `Query must start with SELECT, DELETE, SHOW or DESCRIBE`（`OpenSearchActionFactory.java:135`）；V2: ANTLR 语法错误                                   | 文法无 WITH 规则（`OpenSearchSQLLexer.g4` 无 WITH token）                                                                                                       |
-| 3 表+ JOIN       | `currently supports only 2 tables join`（`SqlParser.java:380`）                                                                                         | Legacy V1 限制                                                                                                                                            |
-| JOIN + GROUP BY | `JOIN queries do not support aggregations on the joined result.`（`Util.java:44`）                                                                      | Legacy V1 限制                                                                                                                                            |
-| EXISTS 子查询      | 普通 EXISTS 和嵌套字段 EXISTS 均报错: `Unsupported subquery`（`SubQueryRewriter.java:74`） | `SubQueryRewriter` 在早期阶段拦截所有 EXISTS 子查询；代码中 `NestedExistsRewriter.java` 存在但执行流无法到达（已实测验证，含嵌套字段索引） |
-| 标量子查询           | V2: `Subsearch is supported only when plugins.calcite.enabled=true`（`ExpressionAnalyzer.java:470`）；Legacy: `unsupported expr`（Druid 解析失败） | V2 抛 `getOnlyForCalciteException`，仅 Calcite 引擎有实现（SQL 仅 UNION 走 Calcite，普通 SELECT 不走）；Legacy 遇到子查询作为字段直接抛异常（已实测验证）                       |
-| COALESCE        | V2: `unsupported function name: coalesce`（`BuiltinFunctionRepository.java:145`）；Legacy: `not supported in Schema`（`SelectResultSet.java:360`）         | V2 函数注册表未注册 COALESCE（`BuiltinFunctionRepository.java:73-85`）                                                                                            |
-| DATE_HISTOGRAM  | V2 无此函数；INTERVAL 参数处理有已知 bug                                                                                                                          | V2 core 无 DATE_HISTOGRAM 函数注册；`RexStandardizer.java:117` 注释 "INTERVAL_TYPES has bug, introduced by calcite-1.41.1"；Legacy 实际支持（`AggMaker.java:558-611`） |
+| 限制              | 错误信息                                                                                                                                          | 根因                                                                                                                                                      |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| CTE             | Legacy: `Query must start with SELECT, DELETE, SHOW or DESCRIBE`（`OpenSearchActionFactory.java:135`）；V2: ANTLR 语法错误                           | 文法无 WITH 规则（`OpenSearchSQLLexer.g4` 无 WITH token）                                                                                                       |
+| 3 表+ JOIN       | `currently supports only 2 tables join`（`SqlParser.java:380`）                                                                                 | Legacy V1 限制                                                                                                                                            |
+| JOIN + GROUP BY | `JOIN queries do not support aggregations on the joined result.`（`Util.java:44`）                                                              | Legacy V1 限制                                                                                                                                            |
+| EXISTS 子查询      | 普通 EXISTS 和嵌套字段 EXISTS 均报错: `Unsupported subquery`（`SubQueryRewriter.java:74`）                                                                | `SubQueryRewriter` 在早期阶段拦截所有 EXISTS 子查询；代码中 `NestedExistsRewriter.java` 存在但执行流无法到达（已实测验证，含嵌套字段索引）                                                       |
+| 标量子查询           | V2: `Subsearch is supported only when plugins.calcite.enabled=true`（`ExpressionAnalyzer.java:470`）；Legacy: `unsupported expr`（Druid 解析失败）     | V2 抛 `getOnlyForCalciteException`，仅 Calcite 引擎有实现（SQL 仅 UNION 走 Calcite，普通 SELECT 不走）；Legacy 遇到子查询作为字段直接抛异常（已实测验证）                                      |
+| COALESCE        | V2: `unsupported function name: coalesce`（`BuiltinFunctionRepository.java:145`）；Legacy: `not supported in Schema`（`SelectResultSet.java:360`） | V2 函数注册表未注册 COALESCE（`BuiltinFunctionRepository.java:73-85`）                                                                                            |
+| DATE_HISTOGRAM  | V2 无此函数；INTERVAL 参数处理有已知 bug                                                                                                                  | V2 core 无 DATE_HISTOGRAM 函数注册；`RexStandardizer.java:117` 注释 "INTERVAL_TYPES has bug, introduced by calcite-1.41.1"；Legacy 实际支持（`AggMaker.java:558-611`） |
 
 ---
 
@@ -592,7 +595,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 | 测试索引（1M）            | `perf_test`：6 primary shard + 1 replica = 12 shard，1,000,000 文档，390 MB                                                                                                       |
 | 分片分布（1M）            | 每节点 4 shard（2 primary + 2 replica），约 33 MB/shard                                                                                                                             |
 | 段（segment）数（1M）     | 39 个（未执行 forcemerge，保持导入后自然状态）                                                                                                                                               |
-| 测试索引（10M）           | `perf_test_10m`：6 primary shard + 1 replica = 12 shard，10,000,000 文档，5 GB（5.2.1/5.3.2/5.4 节使用）                                                                              |
+| 测试索引（10M）           | `perf_test_10m`：6 primary shard + 1 replica = 12 shard，10,000,000 文档，5 GB（5.2.1/5.3.2/5.4 节使用）                                                                               |
 | 分片分布（10M）           | 每节点 4 shard（2 primary + 2 replica），约 417 MB/shard                                                                                                                            |
 | 段（segment）数（10M）    | 约 60 个（10M 批量导入后自然状态）                                                                                                                                                        |
 | 元数据索引               | `perf_test_meta`：3 shard + 1 replica，100 文档                                                                                                                                  |
@@ -747,14 +750,14 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 
 **端到端开销分解**：`_explain` 翻译开销与端到端开销的差异随结果集大小增长：
 
-| 场景      | `_explain` p50 (ms)    | 端到端开销 (ms) | 差异 (ms) | 差异来源                     |
-| ------- |:----------------------:|:----------:|:-------:| ------------------------ |
-| A1 点查   | 1.05                   | 2.22       | 1.17    | 序列化(10行) + 线程调度 + 网络往返   |
-| C1 聚合   | 0.82                   | 2.47       | 1.65    | 序列化(4桶) + 聚合结果处理 + 线程调度  |
-| D3 大结果集 | ~1.05 (估，引用 G0-1 点查基线) | 9.31       | ~8.26   | **序列化(1000行) 占主导**，约 8ms |
+| 场景      | `_explain` p50 (ms)    | 端到端开销 (ms) | 差异 (ms) | 差异来源                                            |
+| ------- |:----------------------:|:----------:|:-------:| ----------------------------------------------- |
+| A1 点查   | 1.05                   | 2.22       | 1.17    | SQL 额外序列化(10行 JDBC 转换) + sql-worker 线程调度 + 网络往返 |
+| C1 聚合   | 0.82                   | 2.47       | 1.65    | SQL 额外序列化(4桶 JDBC 转换) + 聚合结果处理 + 线程调度           |
+| D3 大结果集 | ~1.05 (估，引用 G0-1 点查基线) | 9.31       | ~8.26   | **SQL 额外序列化(1000行 JDBC 转换) 占主导**，约 8ms          |
 
-- 轻查询差异 1.17-1.65ms：`JdbcResponseFormatter` 序列化 + sql-worker 线程调度 + HTTP 往返
-- D3 差异 ~8.26ms：序列化 1000 行 JSON 占 ~90%，与 4.7 节"序列化开销可达 10-50ms"预期一致
+- 轻查询差异 1.17-1.65ms：`JdbcResponseFormatter` JDBC 格式转换 + sql-worker 线程调度 + HTTP 往返。注：DSL 的 `ToXContent` 原生序列化开销已在 DSL 基线中，此处差异是 SQL **额外**的格式化开销
+- D3 差异 ~8.26ms：SQL `JdbcResponseFormatter` 把 1000 行 `SearchResponse` 转为 JDBC `List<Object[]>` 再序列化 JSON，比 DSL 原生 `ToXContent` 多一层对象转换，占差异的 ~90%
 - 网络：3 节点同机回环 <0.1ms，生产环境跨节点 0.5-2ms 差异会更大
 - **差值分解（非交叉验证）**：G0-1 `_explain` 1.05ms + 差值 1.17ms = A1 端到端开销 2.22ms。此处差值 1.17ms 由端到端减 `_explain` 反推得出（序列化 + 线程调度 + 网络），**非独立测量**，不能作为独立验证——仅说明端到端开销与 `_explain` 翻译开销的差值合理（见 §5.8 局限性 4）。D3 引用 G0-1（点查）而非 G0-2（聚合）基线，因 D3 查询语义（`WHERE` + `LIMIT`，无 `GROUP BY`）与 G0-1 匹配
 
@@ -977,16 +980,16 @@ SQL 3913ms vs DSL 28ms（140 倍）。根因是 V2 引擎的 **composite 聚合�
 ### 6.2 工作量估算
 
 | 优先级    | 特性                | 模式    | 人天    | 代码量 (LOC) | 理由                                                                    |
-|:------:| ----------------- | ----- |:-----:|:----------:| --------------------------------------------------------------------- |
-| **P1** | COALESCE          | 函数注册  | 1-2   | 50-100     | Calcite 原生支持，仅需声明 operator + enum + grammar                        |
-| **P1** | DATE_HISTOGRAM    | 聚合修复  | 3-5   | 200-400    | 修复 bug，时序分析基础                                                         |
-| **P2** | 3表+ JOIN          | 计划级路由 | 5-8   | 400-600    | 复用 UNION 三步模式                                                         |
-| **P2** | EXISTS 子查询        | 计划级路由 | 3-5   | 400-600    | SqlV2QueryParser 有参考                                                  |
-| **P3** | JOIN + GROUP BY   | 依赖 P2 | 5-8   | 200-400    | 需验证 schema 解析+字段名冲突                                                   |
-| **P3** | 子查询 + 外层 GROUP BY | 依赖 P2 | 5-8   | 200-400    | 需验证派生表 schema 传播                                                      |
-| **P3** | 统计信息注入            | 独立工作流 | 20-40 | 800-1500   | 让 Calcite CBO 生效，但当前 SQL 默认走 V2 不经 Calcite，需 Calcite 成为 SQL 默认引擎后才有价值 |
-| **P4** | 标量子查询             | 表达式级  | 8-12  | 300-500    | 复杂度最高                                                                 |
-| **P5** | CTE               | 语句级   | 15-25 | 600-1000   | 文法+AST+作用域管理                                                      |
+|:------:| ----------------- | ----- |:-----:|:---------:| --------------------------------------------------------------------- |
+| **P1** | COALESCE          | 函数注册  | 1-2   | 50-100    | Calcite 原生支持，仅需声明 operator + enum + grammar                           |
+| **P1** | DATE_HISTOGRAM    | 聚合修复  | 3-5   | 200-400   | 修复 bug，时序分析基础                                                         |
+| **P2** | 3表+ JOIN          | 计划级路由 | 5-8   | 400-600   | 复用 UNION 三步模式                                                         |
+| **P2** | EXISTS 子查询        | 计划级路由 | 3-5   | 400-600   | SqlV2QueryParser 有参考                                                  |
+| **P3** | JOIN + GROUP BY   | 依赖 P2 | 5-8   | 200-400   | 需验证 schema 解析+字段名冲突                                                   |
+| **P3** | 子查询 + 外层 GROUP BY | 依赖 P2 | 5-8   | 200-400   | 需验证派生表 schema 传播                                                      |
+| **P3** | 统计信息注入            | 独立工作流 | 20-40 | 800-1500  | 让 Calcite CBO 生效，但当前 SQL 默认走 V2 不经 Calcite，需 Calcite 成为 SQL 默认引擎后才有价值 |
+| **P4** | 标量子查询             | 表达式级  | 8-12  | 300-500   | 复杂度最高                                                                 |
+| **P5** | CTE               | 语句级   | 15-25 | 600-1000  | 文法+AST+作用域管理                                                          |
 
 ### 6.3 总工作量
 
@@ -1192,7 +1195,7 @@ SQL 相对于 DSL 的性能劣化**在大多数场景下可接受**，但存在�
 | 高基数聚合（≥50K桶）            | 99.3%  | 3885ms    | ❌ 不可接受（composite 架构瓶颈） |
 
 - **纯翻译开销**：0.82-4.36ms（`_explain` 直接测量），远低于预期，不构成瓶颈
-- **序列化开销**：随结果集行数线性增长（~8μs/行），与数据量无关，是大结果集场景的主要开销
+- **序列化开销**：SQL `JdbcResponseFormatter` JDBC 格式转换随结果集行数线性增长（~8μs/行），与数据量无关，是大结果集场景的主要额外开销（DSL 原生 `ToXContent` 序列化已在基线中）
 - **聚合机制开销**：随桶数指数增长，是 V2 composite 聚合架构设计 + `AGGREGATION_BUCKET_SIZE=1000` 硬编码共同导致的确定性瓶颈
 - **"大数据量劣化比例小"假设**：在序列化主导和低基数聚合场景成立（控制变量验证：占比 ↓8-13pp / ↓2-9pp）；在高基数聚合场景不成立（占比 ↑2pp，composite 分页成本随数据量上升）
 - **测试条件声明**：以上结论基于单连接串行测试（3 节点、4GB heap、JDK 25、M4 Pro），并发负载与故障恢复未验证
@@ -1214,14 +1217,14 @@ SQL 相对于 DSL 的性能劣化**在大多数场景下可接受**，但存在�
 SQL 插件当前能力存在若干缺口，但均有明确的扩展路径：
 
 | 优先级 | 特性                           | 模式    | 人天    | 代码量 (LOC) | 理由                                                                    |
-|:---:| ---------------------------- | ----- |:-----:|:----------:| --------------------------------------------------------------------- |
-| P1  | COALESCE                     | 函数注册  | 1-2   | 50-100     | Calcite 原生支持，仅需声明 operator                                                     |
-| P1  | DATE_HISTOGRAM               | 聚合修复  | 3-5   | 200-400    | 修复 bug，时序分析基础                                                       |
-| P2  | 3表+ JOIN / EXISTS            | 计划级路由 | 8-13  | 800-1200   | 复用 UNION 三步模式                                                           |
-| P3  | JOIN+GROUP BY / 子查询+GROUP BY | 依赖 P2 | 10-16 | 400-800    | schema 验证                                                             |
-| P3  | 统计信息注入                       | 独立工作流 | 20-40 | 800-1500   | 让 Calcite CBO 生效，但当前 SQL 默认走 V2 不经 Calcite，需 Calcite 成为 SQL 默认引擎后才有价值 |
-| P4  | 标量子查询                        | 表达式级  | 8-12  | 300-500    | 复杂度最高                                                                 |
-| P5  | CTE                          | 语句级   | 15-25 | 600-1000   | 文法+AST+作用域                                                            |
+|:---:| ---------------------------- | ----- |:-----:|:---------:| --------------------------------------------------------------------- |
+| P1  | COALESCE                     | 函数注册  | 1-2   | 50-100    | Calcite 原生支持，仅需声明 operator                                            |
+| P1  | DATE_HISTOGRAM               | 聚合修复  | 3-5   | 200-400   | 修复 bug，时序分析基础                                                         |
+| P2  | 3表+ JOIN / EXISTS            | 计划级路由 | 8-13  | 800-1200  | 复用 UNION 三步模式                                                         |
+| P3  | JOIN+GROUP BY / 子查询+GROUP BY | 依赖 P2 | 10-16 | 400-800   | schema 验证                                                             |
+| P3  | 统计信息注入                       | 独立工作流 | 20-40 | 800-1500  | 让 Calcite CBO 生效，但当前 SQL 默认走 V2 不经 Calcite，需 Calcite 成为 SQL 默认引擎后才有价值 |
+| P4  | 标量子查询                        | 表达式级  | 8-12  | 300-500   | 复杂度最高                                                                 |
+| P5  | CTE                          | 语句级   | 15-25 | 600-1000  | 文法+AST+作用域                                                            |
 
 - UNION 扩展的"三步模式"（AstBuilder 不抛异常 → shouldUseCalcite 路由 → CalciteRelNodeVisitor 实现）仅适用于**计划级路由**扩展；函数注册、聚合修复等需不同模式
 - 快速收益（P1）：4-7 人天即可补齐 COALESCE、DATE_HISTOGRAM
