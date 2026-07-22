@@ -710,8 +710,6 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 > **测量方法**：`_explain` 端点（`POST /_plugins/_sql/_explain`）走与 execute 相同的 V2 路径（ANTLR parse → AstBuilder → `Analyzer.analyze()` → `Planner.plan()`），仅在最后调用 `executionEngine.explain()` 而非 `execute()`——跳过物理执行，保留全部翻译+规划开销。因此 `_explain` 端点端到端延迟即为 V2 翻译开销的直接测量（含计划序列化 + 网络/排队，不含执行）。预热 20 轮，正式测量 200 轮。
 > 
 > **代码路径验证**：`SQLService.explain()`（`SQLService.java:61`）调用与 `execute()`（`SQLService.java:44`）相同的 `plan()` 方法（`SQLService.java:69`），共享 ANTLR 解析 + AstBuilder + AstStatementBuilder。`QueryService.explain()`（`QueryService.java:124`）与 `execute()`（`QueryService.java:102`）均调用 `shouldUseCalcite()` 路由，且 `explainWithLegacy()`（line 257）与 `executeWithLegacy()`（line 229）均调用相同的 `analyze(plan, queryType)`（line 268/235）→ `analyzer.analyze()`（line 320）。唯一差异：explain 调 `executionEngine.explain()`，execute 调 `executionEngine.execute()`。
-> 
-> ⚠️ 原文档声明 "`_explain` 走 legacy explain 路径，不经过 V2 ANALYZE"——**此声明经代码验证为错误**。V1/Druid 路径仅作为 fallback（`RestSqlAction.explainRequest()` line 274），仅在 V2 抛 `SyntaxCheckException` 时触发。本次测试查询均未触发 fallback。
 
 | 场景         | 查询                                                                                                                                                                                     | `_explain` p50 (ms) | `_explain` p95 (ms) | `_explain` p99 (ms) | `_explain` max (ms) | `_explain` mean (ms) | 预期区间 (ms) |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |:-------------------:|:-------------------:|:-------------------:|:-------------------:|:--------------------:|:---------:|
@@ -829,7 +827,7 @@ SQL 3913ms vs DSL 28ms（140 倍）。根因是 V2 引擎的 **composite 聚合�
 
 **影响**：任何 `GROUP BY <高基数字段>` + `ORDER BY <聚合字段>` + `LIMIT` 的 SQL 查询在高基数（>10K 桶）场景下都会出现此问题。非偶发 bug。
 
-**缓解方案**：① 使用 DSL terms 聚合；② SQL 中添加 WHERE 条件降低基数；③ 使用 PPL `stats`（走 Calcite pushdown，有 terms 转换）；④ 调高 `AGGREGATION_BUCKET_SIZE`（如 10000，需改代码，分页轮次从 100 降至 10）；⑤ 调低 `AGGREGATION_BUCKET_SIZE`（需改代码，减少单次拉取量）
+**缓解方案**：① 使用 DSL terms 聚合；② SQL 中添加 WHERE 条件降低基数；③ 使用 PPL `stats`（走 Calcite pushdown，有 terms 转换）；④ 调高 `AGGREGATION_BUCKET_SIZE`（如 10000，需改代码，分页轮次从 100 降至 10，但单次拉取量增大，内存压力上升）
 
 **G3 高基数聚合分析**：SQL 74ms / DSL 9.2ms（8 倍），与 1M C1-H（78ms / 13ms，6 倍）相比 SQL 时间相近但 DSL 更快（因 G3 有时间过滤扫描文档更少）。开销占比 87.6%（高于 C1-H 83.2%），因 DSL 基线更低导致固定开销占比放大。
 
