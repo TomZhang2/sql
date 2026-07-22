@@ -419,32 +419,6 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 ### 4.5 测试方法
 
-#### 翻译开销分解方法
-
-> **核心原则**：slowlog 毫秒精度（±1ms）与翻译开销同量级，**不可直接用 `T_sql - T_slowlog` 分解**。改用以下方法：
-
-**方法 A（推荐）：`_explain` 端点直接测量**
-
-- 向 `POST /_plugins/_sql/_explain` 发送与执行查询相同的 SQL，测量端到端响应延迟
-- `_explain` 走与 execute 相同的 V2 路径（ANTLR → AstBuilder → Analyzer → Planner），仅跳过物理执行（`executionEngine.explain()` vs `execute()`）
-- 因此 `_explain` 延迟 = 翻译开销 + 计划序列化 + 网络/排队，是 V2 翻译开销的直接测量
-- 代码路径验证见 §5.5
-
-**方法 B（验证用）：slowlog 交叉验证**
-
-1. 运行 SQL 查询，记录端到端延迟 `T_sql`
-2. 从 slowlog 提取服务端执行时间 `T_exec`
-3. 运行等价 DSL，记录 `T_dsl`
-4. **验证 `T_exec ≈ T_dsl`**（此等式成立则证明 SQL 与 DSL 服务端执行等价）
-5. 翻译开销 ≠ `T_sql - T_exec`（含网络/排队/序列化），用方法 A 的 `_explain` 耗时作为翻译开销
-
-**方法 C（备选）：`_nodes/stats` 累计均值**
-
-- `_nodes/stats` 的 `indices/search/query_time_in_millis / query_total` 拿到纳秒级累积均值
-- 适合大规模样本下的均值估算，不适合分位数
-
-> ⚠️ **不使用** `_explain` 提取的 DSL 来测执行时间——explain 不触发 Janino codegen、不触发 fallback、不经过 sql-worker 调度，输出与实际执行 DSL 可能不同（`executeWithCalcite` 会加 `LogicalSystemLimit`，执行时还有 retry/fallback 逻辑）。
-
 #### 压测脚本框架
 
 ```python
