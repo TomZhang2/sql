@@ -158,10 +158,11 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | 结果格式化  | `ToXContent` 原生输出（含在 DSL 基线中） | `JdbcResponseFormatter` JDBC 对象转换 + JSON 序列化，随行数线性增长 | 同 V2                         | `PrettyFormatRestExecutor`        |
 | 线程池    | search (8核→13线程)              | sql-worker (8核→8线程)                                  | sql-worker                   | sql-worker→search                 |
 
-> **SQL 额外开销 = 翻译开销 + 结果格式化开销 + 线程调度开销**：
+> **SQL 额外开销 = 翻译开销 + 结果格式化开销 + 内存计算开销 + 线程调度开销**：
 > 
 > - **翻译开销**（解析+分析+规划）：G0 实测 0.82-4.36ms（`_explain` 直接测量，见 §5.5），与结果集大小无关，恒定
 > - **结果格式化开销**：`JdbcResponseFormatter` 把 `SearchResponse` 转为 JDBC `List<Object[]>` 再序列化 JSON，比 DSL 原生 `ToXContent` 多一层对象转换。实测随行数线性增长：~1ms(10行) → ~8ms(1K行) → ~80ms(10K行)
+> - **内存计算开销**：SQL 独有能力（JOIN/UNION/窗口函数/聚合排序）在协调节点内存计算，DSL 不产生此开销。如 `BlockHashJoin`（V1）、`TakeOrderedOperator`（V2）、Enumerable 合并（Calcite）。高基数聚合场景此开销可达数千 ms（见 §5.6.4 H1）
 > - DSL 的 `ToXContent` 序列化开销已包含在 DSL 基线延迟中，不计入"额外开销"
 > 
 > 以上耗时为白盒估算区间，实测数据见第五章。
@@ -761,11 +762,11 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 
 **端到端开销分解**：`_explain` 翻译开销与端到端开销的差异随结果集大小增长：
 
-| 场景      | `_explain` p50 (ms)    | 端到端开销 (ms) | 差异 (ms) | 差异来源                                            |
-| ------- |:----------------------:|:----------:|:-------:| ----------------------------------------------- |
-| A1 点查   | 1.05                   | 2.22       | 1.17    | SQL 额外序列化(10行 JDBC 转换) + sql-worker 线程调度 + 网络往返 |
-| C1 聚合   | 0.82                   | 2.47       | 1.65    | SQL 额外序列化(4桶 JDBC 转换) + 聚合结果处理 + 线程调度           |
-| D3 大结果集 | ~1.05 (估，引用 G0-1 点查基线) | 9.31       | ~8.26   | **SQL 额外序列化(1000行 JDBC 转换) 占主导**，约 8ms          |
+| 场景      | `_explain` p50 (ms)    | 端到端开销 (ms) | 差异 (ms) | 差异来源                                                    |
+| ------- |:----------------------:|:----------:|:-------:| ------------------------------------------------------- |
+| A1 点查   | 1.05                   | 2.22       | 1.17    | SQL 额外序列化(10行 JDBC 转换) + sql-worker 线程调度 + 网络往返         |
+| C1 聚合   | 0.82                   | 2.47       | 1.65    | SQL 额外序列化(4桶 JDBC 转换) + TakeOrderedOperator 内存排序 + 线程调度 |
+| D3 大结果集 | ~1.05 (估，引用 G0-1 点查基线) | 9.31       | ~8.26   | **SQL 额外序列化(1000行 JDBC 转换) 占主导**，约 8ms                  |
 
 - 轻查询差异 1.17-1.65ms：`JdbcResponseFormatter` JDBC 格式转换 + sql-worker 线程调度 + HTTP 往返。注：DSL 的 `ToXContent` 原生序列化开销已在 DSL 基线中，此处差异是 SQL **额外**的格式化开销
 - D3 差异 ~8.26ms：SQL `JdbcResponseFormatter` 把 1000 行 `SearchResponse` 转为 JDBC `List<Object[]>` 再序列化 JSON，比 DSL 原生 `ToXContent` 多一层对象转换，占差异的 ~90%
@@ -905,7 +906,7 @@ SQL 3913ms vs DSL 28ms（140 倍）。根因是 V2 引擎的 **composite 聚合�
 
 | 纯翻译开销      | 0.82-4.36ms（G0）          | —                 | ~1ms（估）             | —                 | 未测                   | **恒定**                     |
 | 序列化开销      | ~1.5ms（10行）→8.5ms（1000行） | ~14ms（1000行）      | ~80ms（10K行）         | ~85ms（10K行）       | ~80ms（10K行）          | **随结果集线性增长，与数据量无关**        |
-| 聚合机制开销     | 2.1-2.5ms（4-5桶）          | 2.8-2.9ms（4-5桶）   | 65ms（10K桶）          | 99ms（10K桶）        | 65-3885ms（10K-100K桶） | **随桶数指数增长，composite 架构瓶颈** |
+| 内存计算开销     | 2.1-2.5ms（4-5桶 composite 排序） | 2.8-2.9ms（4-5桶）   | 65ms（10K桶 composite 排序） | 99ms（10K桶）        | 65-3885ms（10K-100K桶） | **随桶数/数据量增长，composite 架构瓶颈** |
 
 **假设验证结论（分维度）**：
 
