@@ -178,7 +178,7 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | --------------- |:---:|:---:| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 等值/范围查询         | ✅   | ✅   | SQL `WHERE`; DSL `term`/`range`                                                                                                                                              |
 | 多条件布尔查询         | ✅   | ✅   | SQL `AND`/`OR`; DSL `bool`                                                                                                                                                   |
-| 全文搜索            | ⚠️  | ✅   | SQL `match()`/`multi_match()`; DSL 完整参数                                                                                                                                      |
+| 全文搜索            | ✅   | ✅   | SQL `match()`/`multi_match()`/`match_phrase()`，支持 boost/fuzziness/analyzer/minimum_should_match 参数；不支持 `query_string`/`simple_query_string`/`operator`（`AND` 为 SQL 关键字冲突） |
 | GROUP BY 聚合     | ✅   | ✅   | SQL `GROUP BY`; DSL `aggs`                                                                                                                                                   |
 | 窗口函数            | ✅   | ❌   | SQL `RANK() OVER(...)`; DSL 不支持                                                                                                                                              |
 | 2 表 JOIN        | ✅   | ❌   | SQL（回退 Legacy V1）; DSL 不支持                                                                                                                                                   |
