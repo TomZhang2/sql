@@ -162,18 +162,16 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 > 
 > - **翻译开销**（解析+分析+规划）：G0 实测 0.82-4.36ms（`_explain` 直接测量，见 §5.5），与结果集大小无关，恒定
 > - **结果格式化开销**：`JdbcResponseFormatter` 把 `SearchResponse` 转为 JDBC `List<Object[]>` 再序列化 JSON，比 DSL 原生 `ToXContent` 多一层对象转换。实测随行数线性增长：~1ms(10行) → ~8ms(1K行) → ~80ms(10K行)
-> - **线程调度开销**：sql-worker 独立线程池，非 search 池
 > - DSL 的 `ToXContent` 序列化开销已包含在 DSL 基线延迟中，不计入"额外开销"
 > 
 > 以上耗时为白盒估算区间，实测数据见第五章。
 
-### 2.4 关键差异点
+**关键差异点**：
 
-1. **SQL 最终翻译为 DSL，但 Calcite 路径有例外**——V2 和 Legacy V1 路径完全翻译为 DSL；Calcite 路径可下推部分（filter/agg/sort/limit）翻译为 DSL，不可下推部分通过 Enumerable 算子在协调节点内存计算（Janino codegen），不走 DSL。因此 Calcite 路径的额外开销 = 翻译 + 内存计算，而非纯翻译
-2. **结果格式化差异**——DSL 用 OpenSearch 原生 `ToXContent` 直接输出 JSON；SQL 用 `JdbcResponseFormatter` 先将 `SearchResponse` 转为 JDBC `List<Object[]>` 再序列化，多一层对象转换。大结果集场景此开销可达 ~80ms（10K 行），是 SQL 额外开销的主要来源
-3. **线程池隔离**——DSL 走 `search` 线程池（8 核→13 线程），SQL 走 `sql-worker` 独立线程池（=allocatedProcessors，8 核→8 线程）。Legacy V1 路径从 sql-worker 穿透到 search 池。两池隔离意味着高并发 SQL 不会直接挤占 DSL 线程，但 circuit breaker 是全局的（见 §4.8 I1）
-4. **游标机制不同**——DSL `search_after`（无状态）vs V2 序列化游标（有状态，PIT + searchAfter）vs Calcite `EnumerableLimit`。深翻页场景 SQL 可能回退内存分页（见 §4.2 D 组）
-5. **Calcite 内存风险**——UNION/JOIN 在协调节点单线程内存计算，大数据量可能 OOM。`executeWithCalcite` 会加 `LogicalSystemLimit`，但仍存在内存边界
+1. **SQL 最终翻译为 DSL，但 Calcite 路径有例外**——V2 和 Legacy V1 完全翻译为 DSL；Calcite 路径可下推部分（filter/agg/sort/limit）翻译为 DSL，不可下推部分通过 Enumerable 算子在协调节点内存计算（Janino codegen），不走 DSL。因此 Calcite 路径额外开销 = 翻译 + 内存计算
+2. **线程池隔离**——DSL 走 `search` 线程池，SQL 走 `sql-worker` 独立线程池。Legacy V1 路径从 sql-worker 穿透到 search 池。两池隔离意味着高并发 SQL 不直接挤占 DSL 线程，但 circuit breaker 是全局的（见 §4.8 I1）
+3. **游标机制不同**——DSL `search_after`（无状态）vs V2 序列化游标（有状态，PIT + searchAfter）vs Calcite `EnumerableLimit`。深翻页场景 SQL 可能回退内存分页（见 §4.2 D 组）
+4. **Calcite 内存风险**——UNION/JOIN 在协调节点单线程内存计算，大数据量可能 OOM。`executeWithCalcite` 会加 `LogicalSystemLimit`，但仍存在内存边界
 
 ---
 
