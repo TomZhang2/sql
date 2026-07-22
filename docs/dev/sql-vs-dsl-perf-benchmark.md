@@ -233,29 +233,36 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 > **统一配置原则（关键）**：1M 和 10M 测试使用**相同 schema、相同集群配置**，只变化数据量——控制变量以验证"劣化比例随数据量变化"的趋势。
 
-| 项目                  | 配置                                                                        |
-| ------------------- | ------------------------------------------------------------------------- |
-| 硬件                  | Apple M4 Pro, 14 CPU 核心, 48 GB RAM, SSD                                   |
-| 操作系统                | macOS Darwin 25.5.0 (ARM64)                                               |
-| JDK                 | Temurin 25.0.3+9-LTS                                                      |
-| OpenSearch 版本       | 3.7.0-SNAPSHOT                                                            |
-| 集群拓扑                | 3 节点（同物理机），全部为 data+cluster_manager 节点                                    |
-| 每节点 JVM heap        | 4 GB（`-Xms4g -Xmx4g`）                                                     |
-| 网络环境                | 127.0.0.1 回环（无真实网络延迟）                                                     |
-| Calcite 引擎          | `plugins.calcite.enabled=true`，`plugins.calcite.pushdown.enabled=true`    |
-| 测试索引（1M）            | `perf_test`：6 primary shard + 1 replica = 12 shard，1,000,000 文档，390 MB    |
-| 测试索引（10M）           | `perf_test_10m`：6 primary shard + 1 replica = 12 shard，10,000,000 文档，5 GB |
-| 字段数                 | 13（含高基数 user_id=100K, session_id=500K）                                    |
-| Schema              | 1M 和 10M 相同（字段定义、映射类型完全一致）                                                |
-| 段（segment）数         | 1M：39 个 / 10M：约 60 个（均未 forcemerge）                                       |
-| `max_result_window` | 20000（自定义）                                                                |
-| 预热                  | 20 轮                                                                      |
-| 测试轮数                | 200 轮                                                                     |
-| 缓存控制                | C1/C3 场景每 50 轮 `_cache/clear`；A/B/D 组无显式清缓存                               |
+| 项目                  | 配置                                                                                                                                                                        |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 硬件                  | Apple M4 Pro, 14 CPU 核心, 48 GB RAM, SSD                                                                                                                                   |
+| 操作系统                | macOS Darwin 25.5.0 (ARM64)                                                                                                                                               |
+| JDK                 | Temurin 25.0.3+9-LTS                                                                                                                                                      |
+| OpenSearch 版本       | 3.7.0-SNAPSHOT                                                                                                                                                            |
+| 集群拓扑                | 3 节点（node-1/2/3，同物理机），全部为 data+cluster_manager 节点                                                                                                                         |
+| 每节点 JVM heap        | 4 GB（`-Xms4g -Xmx4g`），其余为系统默认                                                                                                                                             |
+| 网络环境                | 127.0.0.1 回环（无真实网络延迟）                                                                                                                                                     |
+| 集群名称                | sql-bench-3node                                                                                                                                                           |
+| HTTP 端口             | 9201 (node-1) / 9202 (node-2) / 9203 (node-3)                                                                                                                             |
+| Transport 端口        | 9301 / 9302 / 9303                                                                                                                                                        |
+| Calcite 引擎          | `plugins.calcite.enabled=true`，`plugins.calcite.pushdown.enabled=true`                                                                                                    |
+| 测试索引（1M）            | `perf_test`：6 primary shard + 1 replica = 12 shard，1,000,000 文档，390 MB，每节点 4 shard（2 primary + 2 replica），约 33 MB/shard                                                   |
+| 测试索引（10M）           | `perf_test_10m`：6 primary shard + 1 replica = 12 shard，10,000,000 文档，5 GB，每节点 4 shard，约 417 MB/shard                                                                      |
+| 元数据索引               | `perf_test_meta`：3 shard + 1 replica，100 文档                                                                                                                               |
+| 字段数                 | 13：@timestamp(date), bytes(long), host/level/region/service/user_id/session_id/request_path(keyword), message(text), response_time_ms/status_code(integer), client_ip(ip) |
+| Schema              | 1M 和 10M 相同（字段定义、映射类型完全一致）                                                                                                                                                |
+| 数据分布                | status_code: 200(70%)/301(10%)/404(10%)/500(5%)/503(5%)；level: INFO(70%)/WARN(15%)/ERROR(10%)/DEBUG(5%)；response_time_ms: 85% <1000, 12% 1000-3000, 3% 3000-10000         |
+| 段（segment）数         | 1M：39 个 / 10M：约 60 个（均未 forcemerge）                                                                                                                                       |
+| `max_result_window` | 20000（自定义）                                                                                                                                                                |
+| 预热                  | 20 轮                                                                                                                                                                      |
+| 测试轮数                | 200 轮                                                                                                                                                                     |
+| 缓存控制                | C1/C3 场景每 50 轮 `_cache/clear`；A/B/D 组无显式清缓存；10M 控制变量场景同策略                                                                                                                 |
+| 测试客户端               | Python 3.14 + requests 2.34.2，单连接 Session（keep-alive）                                                                                                                     |
+| 测试时间                | 2026-07-20（1M 轻查询/重查询/10M 独立场景）+ 2026-07-22（10M 控制变量场景 + G0 重测）                                                                                                           |
 
 > ✅ **可比性**：1M 和 10M 仅数据量不同，其他全部相同——可直接对比劣化比例变化。
 > 
-> ⚠️ **测试轮数不足**：4.5 节原建议 ≥2000 轮支撑 p99 置信区间，实际执行 200 轮，p99 统计意义有限（见 §5.8 局限性 1）。
+> ⚠️ **测试轮数不足**：原建议 ≥2000 轮支撑 p99 置信区间，实际执行 200 轮，p99 统计意义有限（见 §5.8 局限性 1）。
 > 
 > ⚠️ **forcemerge 对照组未执行**：原设计 4 组对比（1M-forced / 1M-unforced / 10M-forced / 10M-unforced），实际仅跑了 unforced 组。
 > 
@@ -585,36 +592,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 
 ## 五、实测数据与测试报告
 
-> 本章记录在 3 节点 OpenSearch 集群上执行的 SQL vs DSL 性能对比实测数据。1M 轻查询/重查询（§5.2/§5.3）、10M 控制变量场景（§5.2.1/§5.3.2，相同查询仅变数据量）、10M 独立场景（§5.4，4.4 节方案）、G0 纯翻译开销基线（§5.5）。不包含 4.8 节生产关键场景。
-
-### 5.1 测试环境
-
-| 项目                  | 实际配置                                                                                                                                                                         |
-| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 操作系统                | macOS Darwin 25.5.0 (ARM64)                                                                                                                                                  |
-| 硬件                  | Apple M4 Pro, 14 CPU 核心, 48 GB RAM, SSD                                                                                                                                      |
-| OpenSearch 版本       | 3.7.0-SNAPSHOT (distribution: opensearch)                                                                                                                                    |
-| JDK                 | Temurin 25.0.3+9-LTS (OpenJDK 64-Bit Server VM)                                                                                                                              |
-| 集群拓扑                | 3 节点（node-1/2/3），全部为 data+cluster_manager 节点                                                                                                                                 |
-| 每节点配置               | 4 GB heap（`-Xms4g -Xmx4g`），其余为系统默认                                                                                                                                           |
-| 网络环境                | 127.0.0.1 回环（3 节点同物理机，无真实网络延迟）                                                                                                                                               |
-| 集群名称                | sql-bench-3node                                                                                                                                                              |
-| HTTP 端口             | 9201 (node-1) / 9202 (node-2) / 9203 (node-3)                                                                                                                                |
-| Transport 端口        | 9301 / 9302 / 9303                                                                                                                                                           |
-| Calcite 引擎          | `plugins.calcite.enabled=true`（代码默认值，`OpenSearchSettings.java:157`），`plugins.calcite.pushdown.enabled=true`                                                                  |
-| 测试索引（1M）            | `perf_test`：6 primary shard + 1 replica = 12 shard，1,000,000 文档，390 MB                                                                                                       |
-| 分片分布（1M）            | 每节点 4 shard（2 primary + 2 replica），约 33 MB/shard                                                                                                                             |
-| 段（segment）数（1M）     | 39 个（未执行 forcemerge，保持导入后自然状态）                                                                                                                                               |
-| 测试索引（10M）           | `perf_test_10m`：6 primary shard + 1 replica = 12 shard，10,000,000 文档，5 GB（5.2.1/5.3.2/5.4 节使用）                                                                               |
-| 分片分布（10M）           | 每节点 4 shard（2 primary + 2 replica），约 417 MB/shard                                                                                                                            |
-| 段（segment）数（10M）    | 约 60 个（10M 批量导入后自然状态）                                                                                                                                                        |
-| 元数据索引               | `perf_test_meta`：3 shard + 1 replica，100 文档                                                                                                                                  |
-| 索引字段                | 13 字段：@timestamp(date), bytes(long), host/level/region/service/user_id/session_id/request_path(keyword), message(text), response_time_ms/status_code(integer), client_ip(ip) |
-| 数据分布                | status_code: 200(70%)/301(10%)/404(10%)/500(5%)/503(5%)；level: INFO(70%)/WARN(15%)/ERROR(10%)/DEBUG(5%)；response_time_ms: 85% <1000, 12% 1000-3000, 3% 3000-10000            |
-| `max_result_window` | 20000（自定义，D3 场景 LIMIT 1000 远低于阈值）                                                                                                                                            |
-| 缓存控制                | C1/C3 场景每 50 轮执行 `_cache/clear`；A/B/D 组无显式清缓存（依赖随机阈值/低命中率）；10M 控制变量场景同策略                                                                                                     |
-| 测试客户端               | Python 3.14 + requests 2.34.2，单连接 Session（keep-alive）                                                                                                                        |
-| 测试时间                | 2026-07-20 20:12-21:05 UTC（1M 轻查询/重查询/10M 独立场景）+ 2026-07-22（10M 控制变量场景 + G0 重测）                                                                                              |
+> 本章记录 SQL vs DSL 性能对比实测数据。测试环境见 §4.1。1M 轻查询/重查询（§5.2/§5.3）、10M 控制变量场景（§5.2.1/§5.3.2，相同查询仅变数据量）、10M 独立场景（§5.4）、G0 纯翻译开销基线（§5.5）。不包含 4.8 节生产关键场景。
 
 ### 5.2 轻查询实测数据（1M 数据，4.2 节场景）
 
