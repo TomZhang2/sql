@@ -417,6 +417,8 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | H2 全表多级聚合    | `SELECT service, level, region, COUNT(*) as cnt, AVG(response_time_ms) as avg_rt, SUM(bytes) as total_bytes FROM perf_test_10m GROUP BY service, level, region ORDER BY service, cnt DESC` | `{"size":0,"aggs":{"by_service":{"terms":{"field":"service"},"aggs":{"by_level":{"terms":{"field":"level"},"aggs":{"by_region":{"terms":{"field":"region"},"aggs":{"avg_rt":{"avg":{"field":"response_time_ms"}},"total_bytes":{"sum":{"field":"bytes"}},"p99":{"percentiles":{"field":"response_time_ms","percents":[99]}}}}}}}}}}` | 600-1500ms |
 | H3 大范围+10K   | ``SELECT * FROM perf_test_10m WHERE `@timestamp` > '2026-07-11T00:00:00Z' ORDER BY response_time_ms DESC LIMIT 10000``                                                                     | `{"query":{"range":{"@timestamp":{"gte":"2026-07-11T00:00:00Z"}}},"sort":[{"response_time_ms":"desc"}],"size":10000}`                                                                                                                                                                                                                | 400-800ms  |
 
+### 4.5 测试方法
+
 #### 翻译开销分解方法
 
 > **核心原则**：slowlog 毫秒精度（±1ms）与翻译开销同量级，**不可直接用 `T_sql - T_slowlog` 分解**。改用以下方法：
@@ -442,8 +444,6 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 - 适合大规模样本下的均值估算，不适合分位数
 
 > ⚠️ **不使用** `_explain` 提取的 DSL 来测执行时间——explain 不触发 Janino codegen、不触发 fallback、不经过 sql-worker 调度，输出与实际执行 DSL 可能不同（`executeWithCalcite` 会加 `LogicalSystemLimit`，执行时还有 retry/fallback 逻辑）。
-
-### 4.5 测试方法
 
 #### 压测脚本框架
 
