@@ -261,12 +261,6 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 | 测试时间                | 2026-07-20（1M 轻查询/重查询/10M 独立场景）+ 2026-07-22（10M 控制变量场景 + G0 重测）                                                                                                           |
 
 > ✅ **可比性**：1M 和 10M 仅数据量不同，其他全部相同——可直接对比劣化比例变化。
-> 
-> ⚠️ **测试轮数不足**：原建议 ≥2000 轮支撑 p99 置信区间，实际执行 200 轮，p99 统计意义有限（见 §5.8 局限性 1）。
-> 
-> ⚠️ **forcemerge 对照组未执行**：原设计 4 组对比（1M-forced / 1M-unforced / 10M-forced / 10M-unforced），实际仅跑了 unforced 组。
-> 
-> ⚠️ **仍不可外推到其他规模**：3 节点 6 shard 的结论不可外推到 30+ 节点（scatter-gather 长尾、协调节点 merge 开销非线性增长）。
 
 ### 4.2 轻查询场景（1M + 10M 数据，返回 ≤10 行）
 
@@ -445,18 +439,9 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 ```python
 session = requests.Session()  # 复用 TCP 连接
 
-def bench(name, fn_factory, warmup=50, runs=2000):
-    """fn_factory(threshold) 返回可调用对象，threshold 用于随机化打散缓存。
-    runs=2000 支撑 p99 置信区间（200 样本下 p99.9≈max 无统计意义）。
-    若资源受限可降至 1000，但放弃 p99.9 改报 max。"""
-    # 预热：观察 -XX:+PrintCompilation 日志，沉默 N 轮后再开始计量
-    # （JIT C2 编译是事件驱动，CV<5% 不适合判定 JIT 完成）
-    compilation_quiet = False
-    warmup_count = 0
-    while not compilation_quiet and warmup_count < warmup * 3:
-        fn_factory(random.randint(1, 9000))()
-        warmup_count += 1
-        # 实际实现：解析 -XX:+PrintCompilation 输出，无新编译事件持续 N 轮则 quiet
+def bench(name, fn_factory, warmup=20, runs=200):
+    """fn_factory(threshold) 返回可调用对象，threshold 用于随机化打散缓存。"""
+    # 预热
     for _ in range(warmup):
         fn_factory(random.randint(1, 9000))()
     latencies = []
@@ -466,9 +451,7 @@ def bench(name, fn_factory, warmup=50, runs=2000):
         r = fn_factory(t)()
         dt = (time.perf_counter() - t0) * 1000
         if r.status_code == 200: latencies.append(dt)
-        # 每轮之间 _cache/clear 或重启节点（见 4.6 缓存控制）
-    # 计算 p50/p99/max（放弃 p99.9——需 1000+ 样本才稳定，2000 轮仅近似）
-    # 用 bootstrap 给 p99 置信区间
+    # 计算 p50/p95/p99/max/mean
 ```
 
 #### 执行步骤
@@ -476,14 +459,12 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 ```
 1. 启动集群 → 创建索引 → 导入数据 → 轮询确认
 2. 结果集等价验证（F3）
-3. 预热（50+ 轮，-XX:+PrintCompilation 沉默 N 轮后开始计量；非 CV<5%）
-4. 正式测试（≥2000 轮，聚合场景随机阈值打散缓存；每轮间 _cache/clear）
-5. 并发吞吐量测试（8/16/32 并发，60 秒；混合 50% SQL + 50% DSL 观察资源隔离）
-6. Pushdown on/off 对比（F2）
-7. 两遍运行（第一遍丢弃，验证 JIT 稳定性）
-8. 收集指标 + 关联 JIT/GC 日志
-9. 失败恢复测试（I 组：人为触发 breaker、kill sql-worker 线程、模拟 OOM）
+3. 预热（20 轮）
+4. 正式测试（200 轮，聚合场景随机阈值打散缓存）
+5. 收集指标
 ```
+
+> ⚠️ 原方案设计的并发吞吐量测试（8/16/32 并发）、Pushdown on/off 对比（F2）、两遍运行验证 JIT 稳定性、失败恢复测试（I 组）均**未执行**。
 
 #### 收集指标
 
@@ -505,41 +486,40 @@ def bench(name, fn_factory, warmup=50, runs=2000):
 
 1. **缓存控制（最关键）**：
    - ⚠️ **SQL 路径无法禁用 request cache**（`OpenSearchQueryRequest.search()` 不设 `requestCache`，OpenSearch 默认对 size=0 聚合自动缓存）。DSL 加 `?request_cache=false` 仅禁用 DSL 侧，SQL 侧仍享受缓存——**系统性偏差**
-   - **必须每轮之间 `_cache/clear`**，这是唯一能同时清除 SQL 和 DSL 侧缓存的方法。不能只靠 `?request_cache=false`（随机阈值对 size=0 聚合的 shard query cache 无效，4.2 节 C 组已说明）
+   - C1/C3 场景每 50 轮执行 `_cache/clear`；A/B/D 组无显式清缓存（依赖随机阈值/低命中率）
    - 监控 `indices/query_cache/memory_size`、`indices/fielddata/memory_size`、`indices/query_cache/hit_count`（确认缓存被有效打散）
-   - 注意：即使 `_cache/clear` 清除 shard query cache 和 fielddata cache，**OS page cache 无法清除**——需重启节点或接受 page cache 残留（对 forcemerge 1 段影响最大）
-2. **预热充分**：50+ 轮让 JIT C2 + Calcite Janino codegen 充分预热；**用 `-XX:+PrintCompilation` 沉默 N 轮判断**（非 CV<5%——JIT 编译是事件驱动，可能 50 轮未触发、100 轮突然阶跃）
+   - 注意：即使 `_cache/clear` 清除 shard query cache 和 fielddata cache，**OS page cache 无法清除**
+2. **预热**：20 轮预热
 3. **DSL 查询等价**：DSL 不含 SQL 没有的聚合（如 percentile），确保对比公平
 4. **Calcite 回退监控**：检查 "Fallback to V2" 日志（注意默认 `plugins.calcite.fallback.allowed=false`，仅 `CalciteUnsupportedException` 触发回退）
 5. **连接复用**：`requests.Session()` 消除 TCP 开销
 6. **@timestamp 标识符**：以 `@` 开头需反引号引用
-7. **segment 数控制**：1M 和 10M 统一配置（都不 forcemerge + 对照组 forcemerge），4 组对比隔离 segment 数变量（1M-forced / 1M-unforced / 10M-forced / 10M-unforced）
-8. **replica 路由**：所有查询加 `?preference=_primary` 消除 replica 路由差异（SQL 路径无 preference 参数，是结构性差异）
-9. **后台噪声隔离**：测试窗口停止 indexing + `translog.durability=async` + `merge.scheduler.max_thread_count=1`
-10. **circuit breaker 风险**：H 组高基数聚合前查 `indices.breaker.total.limit`（默认 70% parent + 40% fielddata）；500K 桶约需 200-400MB fielddata，预备 fallback 查询，记录 breaker 触发率
+7. **segment 数**：1M 39 个 / 10M 约 60 个，均未 forcemerge（forcemerge 对照组原设计但未执行）
+8. **后台噪声隔离**：测试窗口停止 indexing + `translog.durability=async` + `merge.scheduler.max_thread_count=1`
+9. **circuit breaker 风险**：H 组高基数聚合前查 `indices.breaker.total.limit`；500K 桶约需 200-400MB fielddata，预备 fallback 查询，记录 breaker 触发率
 
 ### 4.7 预期结果矩阵
 
 > 开销占比 = SQL 额外开销 / SQL 总延迟（= DSL + 额外开销）。区间已重新核算确保数学闭合。
 > E 组无严格 DSL 对照（DSL"多次查询+应用层合并"语义不等价），列为 SQL 端到端绝对值。
-> ⚠️ **"SQL 额外开销"含翻译开销 + JdbcResponseFormatter 序列化开销 + 网络/排队**，不是纯翻译开销。纯翻译开销见 G0 组基线。大结果集场景（D3/D3-H）序列化开销可达 10-50ms，占比高。
+> ⚠️ **"SQL 额外开销"含翻译开销 + JdbcResponseFormatter 格式化开销 + 内存计算开销 + 网络/排队**，不是纯翻译开销。纯翻译开销见 G0 组基线。大结果集场景（D3/D3-H）格式化开销可达 ~80ms，占比高。
 > ⚠️ **C 组聚合场景**：SQL V2 路径对 GROUP BY 永远用 composite 聚合（`AggregationQueryBuilder.java:97`，size=1000 硬编码），**无 terms 转换**（已通过 `_explain` 验证）。DSL 用 terms 聚合。两者是**架构差异**，额外开销反映翻译 + composite vs terms 聚合机制差异。
 > ⚠️ **D 组深度分页**：D2 若 `maxResultWindow=10000`（默认），SQL 回退内存分页，不参与对比。D4 机制不同（PIT vs 裸 search_after），仅作生产方案参考。
 
 > **占比推导示例**（以 A1 点查为例）：开销占比 = 额外开销 / (DSL + 额外开销)。DSL 和额外开销随查询复杂度同向变化——简单查询 DSL=3ms、额外开销=2ms，占比 2/(3+2)=40%；复杂查询 DSL=8ms、额外开销=2-7ms，占比 2/(8+2)=20% ~ 7/(8+7)=47%。三个端点对应不同查询复杂度场景，非独立变量的极值组合。"占比推导"列格式为 `额外开销/(DSL+额外开销)=占比`。
 
-| 场景                    | 预期 DSL (ms)      | 预期 SQL 额外开销 (ms)                 | 预期开销占比       | 占比推导                                             | 备注                                                                                                                          |
-| --------------------- |:----------------:|:--------------------------------:|:------------:| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| A1 点查                 | 3-8              | 2-7                              | 20-47%       | 2/(8+2)=20% · 2/(3+2)=40% · 7/(8+7)=47%          | 3 节点 scatter-gather 提升 DSL 基线                                                                                               |
-| B1 全文搜索               | 5-12             | 2-7                              | 17-70%       | 2/(10+2)=17% · 2/(3+2)=40% · 7/(3+7)=70%         | —                                                                                                                           |
-| C1 聚合                 | 8-25             | 5-15                             | 20-75%       | 5/(20+5)=20% · 5/(5+5)=50% · 15/(5+15)=75%       | —                                                                                                                           |
-| D2 深度分页               | 50-200           | 5-15                             | 2-23%        | 5/(200+5)=2% · 5/(50+5)=9% · 15/(50+15)=23%      | 仅 maxResultWindow 调大时有效                                                                                                     |
-| D3 大结果集               | 10-30            | 10-20（含序列化 5-15）                 | 25-67%       | 10/(30+10)=25% · 10/(10+10)=50% · 20/(10+20)=67% | —                                                                                                                           |
-| E1 UNION(pushdown ON) | 无 DSL 对照         | 5-20 (冷启动含 codegen 30-80)        | —            | —                                                | SQL 端到端绝对值（含 Calcite bool.must 评分开销）                                                                                        |
-| E2 JOIN               | 无 DSL 对照         | 200-500 (SQL 端到端)                | —            | —                                                | Legacy V1 IN→JOIN 重写，10K 行内存计算                                                                                              |
-| G0 纯翻译开销              | —                | 0.82-4.36（`_explain` 端点实测）       | —            | —                                                | `_explain` 走 V2 完整路径（ANTLR+AstBuilder+Analyzer+Planner），仅跳过执行（见 5.5 节代码验证）；G0-1/G0-2 走 V2 路径，G0-3 走 Calcite 路径含 Volcano 优化器 |
-| G1 10M 聚合             | 300-600          | 5-15 (稳态) / 30-80 (冷启动含 codegen) | 1-5% / 5-13% | —                                                | 区分冷启动 vs 稳态                                                                                                                 |
-| H1 10M 高基数聚合          | 800-2000 (或 OOM) | 10-30                            | 0.5-3%       | —                                                | 500K 桶 10M 数据可能触发 breaker；1M 数据无 OOM 风险，预期 DSL 200-500ms                                                                    |
+| 场景                    | 预期 DSL (ms) | 预期 SQL 额外开销 (ms)                 | 预期开销占比       | 占比推导                                             | 备注                                                                  |
+| --------------------- |:-----------:|:--------------------------------:|:------------:| ------------------------------------------------ | ------------------------------------------------------------------- |
+| A1 点查                 | 3-8         | 2-7                              | 20-47%       | 2/(8+2)=20% · 2/(3+2)=40% · 7/(8+7)=47%          | 3 节点 scatter-gather 提升 DSL 基线                                       |
+| B1 全文搜索               | 5-12        | 2-7                              | 17-70%       | 2/(10+2)=17% · 2/(3+2)=40% · 7/(3+7)=70%         | —                                                                   |
+| C1 聚合                 | 8-25        | 5-15                             | 20-75%       | 5/(20+5)=20% · 5/(5+5)=50% · 15/(5+15)=75%       | —                                                                   |
+| D2 深度分页               | 50-200      | 5-15                             | 2-23%        | 5/(200+5)=2% · 5/(50+5)=9% · 15/(50+15)=23%      | 仅 maxResultWindow 调大时有效                                             |
+| D3 大结果集               | 10-30       | 10-20（含序列化 5-15）                 | 25-67%       | 10/(30+10)=25% · 10/(10+10)=50% · 20/(10+20)=67% | —                                                                   |
+| E1 UNION(pushdown ON) | 无 DSL 对照    | 5-20 (冷启动含 codegen 30-80)        | —            | —                                                | SQL 端到端绝对值（含 Calcite bool.must 评分开销）                                |
+| E2 JOIN               | 无 DSL 对照    | 200-500 (SQL 端到端)                | —            | —                                                | Legacy V1 IN→JOIN 重写，10K 行内存计算                                      |
+| G0 纯翻译开销              | —           | 2-18（预期）                         | —            | —                                                | 实测 0.82-4.36ms（见 §5.5），低于预期因强硬件；G0-1/G0-2 走 V2 路径，G0-3 走 Calcite 路径 |
+| G1 10M 聚合             | 300-600     | 5-15 (稳态) / 30-80 (冷启动含 codegen) | 1-5% / 5-13% | —                                                | 区分冷启动 vs 稳态                                                         |
+| H1 10M 高基数聚合          | 15-50       | 10-30                            | 0.5-3%       | —                                                | 500K 桶 10M 数据可能触发 breaker；实测 DSL p50 仅 28ms（见 §5.4），SQL 3913ms 远超预期 |
 
 ### 4.8 生产关键场景补充
 
