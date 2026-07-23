@@ -149,14 +149,14 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 
 ### 2.3 实现差异对比
 
-| 环节     | DSL                           | SQL (V2)                                             | SQL (Calcite)         | SQL (Legacy V1)                   |
-| ------ | ----------------------------- | ---------------------------------------------------- | --------------------- | --------------------------------- |
-| 请求解析   | JSON 解析                       | ANTLR                                                | ANTLR                 | Druid                             |
-| 语义分析   | 无                             | Analyzer                                             | CalciteRelNodeVisitor | 无                                 |
-| 查询规划   | 无                             | Planner                                              | Calcite Volcano 优化器   | 无                                 |
-| DSL 生成 | 无（本身是 DSL）                    | PhysicalPlan→SearchRequestBuilder                    | Calcite 下推            | 多次 DSL 请求 + 内存合并（如 BlockHashJoin） |
-| 结果格式化  | `ToXContent` 原生输出（含在 DSL 基线中） | `JdbcResponseFormatter` JDBC 对象转换 + JSON 序列化，随行数线性增长 | 同 V2                  | `PrettyFormatRestExecutor`        |
-| 线程池    | search (8核→13线程)              | sql-worker (8核→8线程)                                  | sql-worker            | sql-worker→search                 |
+| 环节     | DSL                           | SQL (V2)                                             | SQL (Calcite)         | SQL (Legacy V1)                              |
+| ------ | ----------------------------- | ---------------------------------------------------- | --------------------- | -------------------------------------------- |
+| 请求解析   | JSON 解析                       | ANTLR                                                | ANTLR                 | Druid                                        |
+| 语义分析   | 无                             | Analyzer                                             | CalciteRelNodeVisitor | 无                                            |
+| 查询规划   | 无                             | Planner                                              | Calcite Volcano 优化器   | 无                                            |
+| DSL 生成 | 无（本身是 DSL）                    | PhysicalPlan→SearchRequestBuilder                    | Calcite 下推            | 多次 DSL 请求 + 内存合并（如 BlockHashJoin）            |
+| 结果格式化  | `ToXContent` 原生输出（含在 DSL 基线中） | `JdbcResponseFormatter` JDBC 对象转换 + JSON 序列化，随行数线性增长 | 同 V2                  | `PrettyFormatRestExecutor`                   |
+| 线程池    | search（OpenSearch 内置）         | sql-worker（SQL 插件独立线程池）                              | sql-worker            | sql-worker→search（Legacy DSL 请求穿透到 search 池） |
 
 > **SQL 额外开销 = 翻译开销 + 结果格式化开销 + 内存计算开销 + 线程调度开销**：
 > 
