@@ -168,7 +168,7 @@ V2 AstBuilder.visitJoinClause() → 抛 SyntaxCheckException
 **关键差异点**：
 
 1. **SQL 支持 DSL 不具备的能力时，通过多次 DSL 请求 + 协调节点内存计算实现**——Legacy V1 的 JOIN 通过 `BlockHashJoin` 对两表各发一次 PIT 查询后内存 hash join；V2 的窗口函数/聚合排序通过 `TakeOrderedOperator` 在协调节点内存计算；Calcite 通过 Enumerable 算子（Janino codegen）内存计算。三者机制不同但本质相同：DSL 不支持的能力 = 多次 DSL + 内存合并
-2. **线程池隔离**——DSL 走 `search` 线程池，SQL 走 `sql-worker` 独立线程池。Legacy V1 路径从 sql-worker 穿透到 search 池。两池隔离意味着高并发 SQL 不直接挤占 DSL 线程，但 circuit breaker 是全局的
+2. **线程池隔离但内存不隔离**——DSL 走 `search` 线程池，SQL 走 `sql-worker` 独立线程池，两池隔离意味着高并发 SQL 不直接挤占 DSL 线程。但两者共享同一 JVM，SQL 的大量内存计算（如高基数聚合 composite 全量拉取）可能将 JVM heap 推至 circuit breaker 阈值，导致同 JVM 的 DSL 查询也被熔断
 3. **游标机制不同**——DSL `search_after`（无状态）vs V2 序列化游标（有状态，PIT + searchAfter）vs Calcite `EnumerableLimit`。深翻页场景 SQL 可能回退内存分页（见 §4.2 D 组）
 4. **Calcite 内存风险**——UNION/JOIN 在协调节点单线程内存计算，大数据量可能 OOM。`executeWithCalcite` 会加 `LogicalSystemLimit`，但仍存在内存边界
 
